@@ -17,9 +17,7 @@ from pydantic import BaseModel, Field
 from xuwen.chat_api import turn_service
 from xuwen.chat_api.chat_pipeline import (
     available_sticker_names,
-    build_policy_hint,
     build_sticker_retry_hint,
-    effective_reply_delay_seconds,
     effective_silence_sentinel,
     extract_life_events,
     extract_need_owner_hints,
@@ -31,7 +29,6 @@ from xuwen.chat_api.chat_pipeline import (
     rule_fallback_need_owner,
     schedule_life_events,
 )
-from xuwen.chat_api.companion_prompt import render_life_memory_context_from_recent
 from xuwen.chat_api.image_store import ImageError, save_data_url
 from xuwen.chat_api.llm_client import GenerationParams
 from xuwen.chat_api.output_filter import AssistantOutputFilter, sanitize_assistant_text
@@ -57,15 +54,12 @@ from xuwen.chat_api.turn_coordinator import TurnSnapshot
 from xuwen.chat_api.vision_client import VisionClient
 from xuwen.chat_api.web_fetch import render_url_context, resolve_fetch_urls
 from xuwen.chat_api.web_search import render_web_context, should_search_web
-from xuwen.companion.life import LifeSnapshot
 from xuwen.companion.response_policy import (
     ResponseDecision,
-    decide_response_policy,
-    refine_decision_with_llm,
 )
 from xuwen.config import Settings
-from xuwen.core.errors import RetrievalError, XuwenError
-from xuwen.core.models import HistoryImageChunk, RetrievalQuery
+from xuwen.core.errors import RetrievalError, RetrievalTimeout, XuwenError
+from xuwen.core.models import HistoryImageChunk
 from xuwen.core.time import local_now
 from xuwen.ingestion.image_importer import _usable_image_description
 from xuwen.memory.writer import WritebackTurn
@@ -73,8 +67,6 @@ from xuwen.persona.prompt import ChatMessage as PromptMessage
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["chat"])
-
-_CHAT_RELATIONSHIP_TIMEOUT_SECONDS = 5.0
 
 # 后台任务引用容器：asyncio 只保留弱引用，任务对象可能被 GC 提前回收中断执行。
 # 用模块级 set 强引用任务，完成后自动丢弃；避免 history_images 异步写入偶发丢失。
@@ -293,55 +285,39 @@ async def chat_completions(
             _spawn_history_image_persist(state, req, image_shas, vlm_descriptions, trace_id)
 
     retrieval_query = current_user_text if current_user_text else "（用户发了一张图片）"
-    _retrieval_start = time.perf_counter()
 
-    async def _retrieve_with_metrics() -> Any:
-        try:
-            result = await asyncio.wait_for(
-                state.retriever.retrieve(
-                    RetrievalQuery(
-                        query_text=retrieval_query,
-                        conversation_id=req.conversation_id,
-                    ),
-                    metrics=state.metrics,
-                    trace_id=trace_id,
-                ),
-                timeout=state.settings.retrieval_timeout_seconds,
-            )
-            state.metrics.record(
-                "retrieval",
-                (time.perf_counter() - _retrieval_start) * 1000,
-                detail=f"final={len(result.fused)}",
-            )
-            return result
-        except TimeoutError:
-            logger.warning(
-                "检索超时 %.1fs，停止本轮聊天",
-                state.settings.retrieval_timeout_seconds,
-            )
-            state.metrics.record(
-                "retrieval",
-                (time.perf_counter() - _retrieval_start) * 1000,
-                error="TimeoutError",
-            )
-            raise HTTPException(
-                status_code=504,
-                detail=(
-                    f"记忆检索超时（>{state.settings.retrieval_timeout_seconds:g}s）。"
-                    "本轮已停止：请先检查 Embedding/向量模型连通性。"
-                ),
-            ) from None
-        except RetrievalError as e:
-            logger.warning("检索失败，停止本轮聊天：%s", e.message)
-            state.metrics.record(
-                "retrieval",
-                (time.perf_counter() - _retrieval_start) * 1000,
-                error=type(e).__name__,
-            )
-            raise HTTPException(
-                status_code=503,
-                detail=f"记忆检索失败，本轮已停止：{e.message}",
-            ) from e
+    # Layer A（共享管道）：检索 / 关系记忆 / life 并发。检索超时/失败抛类型化异常，
+    # 本路由（chat）catch → 504/503（不变量②）；responses 路由 catch → 降级。
+    try:
+        layer_a = await turn_service.run_layer_a(
+            state,
+            route="chat",
+            retrieval_query=retrieval_query,
+            current_user_text=current_user_text,
+            recent=recent,
+            conversation_id=req.conversation_id,
+            trace_id=trace_id,
+        )
+    except RetrievalTimeout as e:
+        logger.warning("检索超时，停止本轮聊天：%s", e.message)
+        state.metrics.record("retrieval", 0.0, error="TimeoutError")
+        raise HTTPException(
+            status_code=504,
+            detail=(
+                f"记忆检索超时（>{state.settings.retrieval_timeout_seconds:g}s）。"
+                "本轮已停止：请先检查 Embedding/向量模型连通性。"
+            ),
+        ) from None
+    except RetrievalError as e:
+        logger.warning("检索失败，停止本轮聊天：%s", e.message)
+        state.metrics.record("retrieval", 0.0, error=type(e).__name__)
+        raise HTTPException(
+            status_code=503,
+            detail=f"记忆检索失败，本轮已停止：{e.message}",
+        ) from e
+    retrieved = layer_a.retrieved
+    relationship_block = layer_a.relationship_block
+    life = layer_a.life
 
     async def _web_search_or_skip() -> str:
         web_should_search = should_search_web(current_user_text)
@@ -380,65 +356,6 @@ async def chat_completions(
             logger.warning("resolve_fetch_urls 失败", exc_info=True)
             return []
 
-    # life 进 Layer A 并发：memory_context 改用 recent（不依赖 retrieved），
-    # relationship_context 同步读 markdown 文件（几 ms 不阻塞），让 life 也能塞进 gather。
-    # 慢路径时 life 模型看不到"相似历史片段"，但 circadian + 上次状态 + recent + 用户输入
-    # 仍是 life 决策的核心信号，影响很小；多数轮走快路径（缓存早退）则几乎零成本。
-    life_markdown = state.relationship_memory.load_markdown()
-
-    async def _life_in_parallel() -> LifeSnapshot:
-        async with state.life_apply_lock:
-            try:
-                return await asyncio.wait_for(
-                    state.life.decide_for_turn(
-                        llm=state.life_llm,
-                        model=state.settings.resolved_life_model,
-                        current_user_text=current_user_text,
-                        recent=recent,
-                        relationship_context=life_markdown,
-                        memory_context=render_life_memory_context_from_recent(recent, state.settings),
-                        trigger="chat",
-                        trace_id=trace_id,
-                        metrics=state.metrics,
-                    ),
-                    timeout=state.settings.life_timeout_seconds,
-                )
-            except TimeoutError:
-                logger.warning(
-                    "life 决策超时 %.1fs，沿用当前 snapshot",
-                    state.settings.life_timeout_seconds,
-                )
-                state.metrics.record("life.decide", 0.0, error="TimeoutError")
-                return state.life.snapshot()
-
-    async def _relationship_context_or_empty() -> str:
-        try:
-            return await asyncio.wait_for(
-                state.relationship_memory.render_context(
-                    retrieval_query,
-                    include_relevant=False,
-                    metrics=state.metrics,
-                    trace_id=trace_id,
-                ),
-                timeout=_CHAT_RELATIONSHIP_TIMEOUT_SECONDS,
-            )
-        except TimeoutError:
-            logger.warning(
-                "关系记忆渲染超时 %.1fs，降级为空上下文",
-                _CHAT_RELATIONSHIP_TIMEOUT_SECONDS,
-            )
-            state.metrics.record("relationship.context", 0.0, error="TimeoutError")
-            return ""
-
-    # Layer A：只放"无论是否回复都需要"的预决策任务（检索 / 关系记忆 / life）。
-    # Web Search / URL Resolve 涉及外部 API 调用 + 用户隐私文本外发，必须等 decision
-    # 确认 should_reply=True 才能启动；否则用户说"别回我"也会触发搜索调用（隐私 + 费用泄漏）。
-    retrieved, relationship_block, life = await asyncio.gather(
-        _retrieve_with_metrics(),
-        _relationship_context_or_empty(),
-        _life_in_parallel(),
-    )
-
     # 模型名固定使用后端配置的 CHAT_MODEL；req.model 接受但忽略
     model_name = state.settings.chat_model
 
@@ -458,57 +375,16 @@ async def chat_completions(
             logger.warning("fetch_many 失败", exc_info=True)
             return ""
 
-    response_decision = decide_response_policy(
+    response_decision, policy_hint = await turn_service.decide_policy(
+        state,
+        route="chat",
         current_user_text=current_user_text,
         has_images=bool(images_in_last),
         retrieved=retrieved,
         life=life,
         relationship_context=relationship_block,
         recent=recent,
-    )
-    state.metrics.record(
-        "response.policy",
-        0.0,
-        detail=f"trace={trace_id},{response_decision.metric_detail()}",
-    )
-    if state.settings.response_policy_model_enabled:
-        try:
-            response_decision = await asyncio.wait_for(
-                refine_decision_with_llm(
-                    base=response_decision,
-                    llm=state.response_policy_llm,
-                    model=state.settings.resolved_response_policy_model,
-                    settings=state.settings,
-                    current_user_text=current_user_text,
-                    recent=recent,
-                    life=life,
-                    relationship_context=relationship_block,
-                    has_images=bool(images_in_last),
-                    trace_id=trace_id,
-                    metrics=state.metrics,
-                ),
-                timeout=state.settings.response_policy_timeout_seconds,
-            )
-        except TimeoutError:
-            logger.warning(
-                "互动策略小模型超时 %.1fs，沿用规则层决策",
-                state.settings.response_policy_timeout_seconds,
-            )
-            state.metrics.record("response.policy.refined", 0.0, error="TimeoutError")
-        state.metrics.record(
-            "response.policy.refined",
-            0.0,
-            detail=f"trace={trace_id},{response_decision.metric_detail()}",
-        )
-    reply_delay_seconds = effective_reply_delay_seconds(
-        life=life,
-        decision=response_decision,
-        settings=state.settings,
-    )
-    policy_hint = build_policy_hint(
-        response_decision,
-        reply_delay_seconds=reply_delay_seconds,
-        reply_delay_reason=life.reply_delay_reason,
+        trace_id=trace_id,
     )
 
     # silence 短路：放在 web/url 调用之前，避免用户说"别说话"还把消息发到搜索 / URL 解析端

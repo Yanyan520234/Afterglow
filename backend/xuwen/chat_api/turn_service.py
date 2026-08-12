@@ -154,12 +154,15 @@ async def run_layer_a(
     recent: list[Any],
     conversation_id: str | None,
     trace_id: str,
+    relationship_graceful_on_exception: bool = False,
 ) -> LayerA:
     """Layer A：并发跑「检索 / 关系记忆 / life」，供后续决策使用。
 
     - **检索**：wait_for 包 retriever.retrieve；超时 → RetrievalTimeout，失败 → RetrievalError
       （均不吞，冒泡给适配层；chat→504/503，responses→降级）。空结果 = 正常返回，不抛。
-    - **关系记忆**：wait_for 包 render_context；超时/异常 → 降级空串（两路由一致）。
+    - **关系记忆**：wait_for 包 render_context；超时→降级空串。
+      `relationship_graceful_on_exception=True` 时（responses）非 Timeout 异常也降级；
+      False 时（chat）非 Timeout 异常向上抛（保持 chat 原语义）。
     - **life**：wait_for 包 decide_for_turn；超时 → snapshot（两路由一致）。
     - `route`（"chat"/"responses"）仅用于 metric 前缀与 life trigger 的参数化。
     """
@@ -214,6 +217,8 @@ async def run_layer_a(
             )
             return ""
         except Exception:
+            if not relationship_graceful_on_exception:
+                raise
             logger.warning(
                 "关系记忆渲染失败，降级为空上下文", exc_info=True
             )
