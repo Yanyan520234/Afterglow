@@ -22,6 +22,7 @@ from typing import Any
 
 from xuwen.chat_api.companion_prompt import (
     build_persona_card_with_companion_context,
+    empty_retrieval_result,
     render_life_memory_context_from_recent,
 )
 from xuwen.chat_api.llm_client import GenerationParams
@@ -154,12 +155,17 @@ async def run_layer_a(
     recent: list[Any],
     conversation_id: str | None,
     trace_id: str,
+    retrieval_fail_open: bool = False,
     relationship_graceful_on_exception: bool = False,
 ) -> LayerA:
     """Layer A：并发跑「检索 / 关系记忆 / life」，供后续决策使用。
 
-    - **检索**：wait_for 包 retriever.retrieve；超时 → RetrievalTimeout，失败 → RetrievalError
-      （均不吞，冒泡给适配层；chat→504/503，responses→降级）。空结果 = 正常返回，不抛。
+    - **检索**：wait_for 包 retriever.retrieve。
+      `retrieval_fail_open=False`（chat）：超时 → RetrievalTimeout，失败 → RetrievalError
+      （均不吞，冒泡给适配层 → 504/503）。
+      `retrieval_fail_open=True`（responses）：失败/超时 → 降级空结果继续（不变量②）。
+      fail_open 时关系记忆/life 仍正常并发计算，与原 responses gather 语义一致。
+      空结果 = 正常返回，不抛。
     - **关系记忆**：wait_for 包 render_context；超时→降级空串。
       `relationship_graceful_on_exception=True` 时（responses）非 Timeout 异常也降级；
       False 时（chat）非 Timeout 异常向上抛（保持 chat 原语义）。
@@ -187,12 +193,23 @@ async def run_layer_a(
                 detail=f"final={len(result.fused)}",
             )
             return result
-        except RetrievalError:
-            raise
+        except RetrievalError as e:
+            if not retrieval_fail_open:
+                raise
+            logger.warning("检索失败，降级到无 RAG 模式：%s", e.message)
+            state.metrics.record("retrieval", 0.0, error=type(e).__name__)
+            return empty_retrieval_result()
         except TimeoutError:
-            raise RetrievalTimeout(
-                f"记忆检索超时（>{state.settings.retrieval_timeout_seconds:g}s）"
-            ) from None
+            if not retrieval_fail_open:
+                raise RetrievalTimeout(
+                    f"记忆检索超时（>{state.settings.retrieval_timeout_seconds:g}s）"
+                ) from None
+            logger.warning(
+                "检索超时 %.1fs，降级到无 RAG 模式",
+                state.settings.retrieval_timeout_seconds,
+            )
+            state.metrics.record("retrieval", 0.0, error="TimeoutError")
+            return empty_retrieval_result()
 
     async def _relationship_context() -> str:
         try:

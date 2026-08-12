@@ -22,22 +22,16 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
+from xuwen.chat_api import turn_service
 from xuwen.chat_api.chat_pipeline import (
     available_sticker_names,
-    build_policy_hint,
     build_sticker_retry_hint,
-    effective_reply_delay_seconds,
     effective_silence_sentinel,
     extract_life_events,
     fallback_for_rejected_sticker,
     is_ai_silence_signal,
     looks_like_sticker_only_intent,
     schedule_life_events,
-)
-from xuwen.chat_api.companion_prompt import (
-    build_persona_card_with_companion_context,
-    empty_retrieval_result,
-    render_life_memory_context_from_recent,
 )
 from xuwen.chat_api.image_store import ImageError, save_data_url
 from xuwen.chat_api.llm_client import GenerationParams
@@ -59,22 +53,15 @@ from xuwen.chat_api.state import AppState, get_state
 from xuwen.chat_api.vision_client import VisionClient
 from xuwen.chat_api.web_fetch import render_url_context, resolve_fetch_urls
 from xuwen.chat_api.web_search import render_web_context, should_search_web
-from xuwen.companion.life import LifeSnapshot
 from xuwen.companion.response_policy import (
     ResponseDecision,
-    decide_response_policy,
-    refine_decision_with_llm,
 )
-from xuwen.core.errors import RetrievalError, XuwenError
-from xuwen.core.models import RetrievalQuery
+from xuwen.core.errors import XuwenError
 from xuwen.memory.writer import WritebackTurn
 from xuwen.persona.prompt import ChatMessage as PromptMessage
-from xuwen.persona.prompt import build_chat_messages
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["responses"])
-
-_RESPONSES_RELATIONSHIP_TIMEOUT_SECONDS = 5.0
 
 
 @router.post("/v1/responses", response_model=None)
@@ -145,42 +132,24 @@ async def responses(
         current_user_text = (current_user_text + "\n" + desc_block).strip()
 
     retrieval_query = current_user_text if current_user_text else "（用户发了一张图片）"
-    _retrieval_start = time.perf_counter()
 
-    async def _retrieve_with_metrics() -> Any:
-        try:
-            result = await asyncio.wait_for(
-                state.retriever.retrieve(
-                    RetrievalQuery(
-                        query_text=retrieval_query,
-                        conversation_id=conversation_id,
-                    ),
-                    metrics=state.metrics,
-                    trace_id=trace_id,
-                ),
-                timeout=state.settings.retrieval_timeout_seconds,
-            )
-            state.metrics.record(
-                "retrieval",
-                (time.perf_counter() - _retrieval_start) * 1000,
-                detail=f"final={len(result.fused)}",
-            )
-            return result
-        except TimeoutError:
-            logger.warning(
-                "Responses 检索超时 %.1fs，降级到无 RAG 模式",
-                state.settings.retrieval_timeout_seconds,
-            )
-            state.metrics.record("retrieval", 0.0, error="TimeoutError")
-            return empty_retrieval_result()
-        except RetrievalError as e:
-            logger.warning("检索失败，降级到无 RAG 模式：%s", e.message)
-            state.metrics.record(
-                "retrieval",
-                (time.perf_counter() - _retrieval_start) * 1000,
-                error=type(e).__name__,
-            )
-            return empty_retrieval_result()
+    # Layer A（共享管道）：检索 / 关系记忆 / life 并发。
+    # 检索失败在本路由（responses）由共享层内部降级为空结果继续（不变量②：
+    # `retrieval_fail_open=True`，且关系记忆/life 照常计算，保持原 gather 并发语义）。
+    layer_a = await turn_service.run_layer_a(
+        state,
+        route="responses",
+        retrieval_query=retrieval_query,
+        current_user_text=current_user_text,
+        recent=recent,
+        conversation_id=conversation_id,
+        trace_id=trace_id,
+        retrieval_fail_open=True,
+        relationship_graceful_on_exception=True,
+    )
+    retrieved = layer_a.retrieved
+    relationship_block = layer_a.relationship_block
+    life = layer_a.life
 
     async def _web_search_or_skip() -> str:
         if state.web_search is None or not should_search_web(current_user_text):
@@ -212,66 +181,6 @@ async def responses(
             logger.warning("resolve_fetch_urls 失败", exc_info=True)
             return []
 
-    # life 进 Layer A 并发：memory_context 改用 recent，relationship_context 同步读 markdown
-    life_markdown = state.relationship_memory.load_markdown()
-
-    async def _life_in_parallel() -> LifeSnapshot:
-        async with state.life_apply_lock:
-            try:
-                return await asyncio.wait_for(
-                    state.life.decide_for_turn(
-                        llm=state.life_llm,
-                        model=state.settings.resolved_life_model,
-                        current_user_text=current_user_text,
-                        recent=recent,
-                        relationship_context=life_markdown,
-                        memory_context=render_life_memory_context_from_recent(recent, state.settings),
-                        trigger="responses",
-                        trace_id=trace_id,
-                        metrics=state.metrics,
-                    ),
-                    timeout=state.settings.life_timeout_seconds,
-                )
-            except TimeoutError:
-                logger.warning(
-                    "Responses life 决策超时 %.1fs，沿用当前 snapshot",
-                    state.settings.life_timeout_seconds,
-                )
-                state.metrics.record("responses.life.decide", 0.0, error="TimeoutError")
-                return state.life.snapshot()
-
-    async def _relationship_context_or_empty() -> str:
-        try:
-            return await asyncio.wait_for(
-                state.relationship_memory.render_context(
-                    retrieval_query,
-                    include_relevant=False,
-                    metrics=state.metrics,
-                    trace_id=trace_id,
-                ),
-                timeout=_RESPONSES_RELATIONSHIP_TIMEOUT_SECONDS,
-            )
-        except TimeoutError:
-            logger.warning(
-                "Responses 关系记忆渲染超时 %.1fs，降级为空上下文",
-                _RESPONSES_RELATIONSHIP_TIMEOUT_SECONDS,
-            )
-            state.metrics.record("responses.relationship.context", 0.0, error="TimeoutError")
-            return ""
-        except Exception:
-            logger.warning("Responses 关系记忆渲染失败，降级为空上下文", exc_info=True)
-            state.metrics.record("responses.relationship.context", 0.0, error="Exception")
-            return ""
-
-    # Layer A：只放"无论是否回复都需要"的预决策任务（检索 / 关系记忆 / life）。
-    # Web Search / URL Resolve 涉及外部 API 调用 + 用户隐私文本外发，必须等 decision
-    # 确认 should_reply=True 才能启动；否则用户说"别回我"也会触发搜索调用（隐私 + 费用泄漏）。
-    retrieved, relationship_block, life = await asyncio.gather(
-        _retrieve_with_metrics(),
-        _relationship_context_or_empty(),
-        _life_in_parallel(),
-    )
-
     # model 字段占位：永远用 .env 的 CHAT_MODEL
     model_name = state.settings.chat_model
 
@@ -290,57 +199,16 @@ async def responses(
             logger.warning("fetch_many 失败", exc_info=True)
             return ""
 
-    decision = decide_response_policy(
+    decision, policy_hint = await turn_service.decide_policy(
+        state,
+        route="responses",
         current_user_text=current_user_text,
         has_images=bool(last_user_images),
         retrieved=retrieved,
         life=life,
         relationship_context=relationship_block,
         recent=recent,
-    )
-    state.metrics.record(
-        "response.policy",
-        0.0,
-        detail=f"trace={trace_id},{decision.metric_detail()}",
-    )
-    if state.settings.response_policy_model_enabled:
-        try:
-            decision = await asyncio.wait_for(
-                refine_decision_with_llm(
-                    base=decision,
-                    llm=state.response_policy_llm,
-                    model=state.settings.resolved_response_policy_model,
-                    settings=state.settings,
-                    current_user_text=current_user_text,
-                    recent=recent,
-                    life=life,
-                    relationship_context=relationship_block,
-                    has_images=bool(last_user_images),
-                    trace_id=trace_id,
-                    metrics=state.metrics,
-                ),
-                timeout=state.settings.response_policy_timeout_seconds,
-            )
-        except TimeoutError:
-            logger.warning(
-                "Responses 互动策略小模型超时 %.1fs，沿用规则层决策",
-                state.settings.response_policy_timeout_seconds,
-            )
-            state.metrics.record("response.policy.refined", 0.0, error="TimeoutError")
-        state.metrics.record(
-            "response.policy.refined",
-            0.0,
-            detail=f"trace={trace_id},{decision.metric_detail()}",
-        )
-    reply_delay_seconds = effective_reply_delay_seconds(
-        life=life,
-        decision=decision,
-        settings=state.settings,
-    )
-    policy_hint = build_policy_hint(
-        decision,
-        reply_delay_seconds=reply_delay_seconds,
-        reply_delay_reason=life.reply_delay_reason,
+        trace_id=trace_id,
     )
     response_id = _new_response_id()
 
@@ -406,40 +274,26 @@ async def responses(
     )
     fetch_many_task: asyncio.Task[str] = asyncio.create_task(_fetch_many_or_skip(fetch_urls))
 
-    persona_card = build_persona_card_with_companion_context(
-        settings=state.settings,
+    persona_card = await turn_service.build_persona_card(
+        state,
         life=life,
         relationship_context=relationship_block,
         style_query=current_user_text,
-        response_policy_context=decision.render_prompt_block(
-            silence_sentinel=effective_silence_sentinel(state.settings),
-        ),
+        decision=decision,
     )
     # 等 Layer B 起的 fetch_many 跑完。如果 prompt 组装已盖住 fetch RTT，这里 await 接近 0ms。
     url_context = await fetch_many_task
 
-    messages = build_chat_messages(
-        settings=state.settings,
+    messages = await turn_service.build_messages(
+        state,
         persona_card=persona_card,
         retrieved=retrieved,
         recent=recent,
         current_user_message=current_user_text or "（图片）",
         web_context=web_context,
         url_context=url_context,
+        images=last_user_images or None,
     )
-
-    if (
-        last_user_images
-        and state.settings.chat_model_supports_vision
-        and messages
-        and messages[-1]["role"] == "user"
-    ):
-        text_for_user = messages[-1]["content"]
-        if isinstance(text_for_user, str):
-            mm_content: list[dict[str, Any]] = [{"type": "text", "text": text_for_user}]
-            for url in last_user_images:
-                mm_content.append({"type": "image_url", "image_url": {"url": url}})
-            messages[-1] = {"role": "user", "content": mm_content}  # type: ignore[dict-item]
 
     params = GenerationParams(
         temperature=req.temperature,

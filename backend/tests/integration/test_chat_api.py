@@ -995,7 +995,9 @@ async def test_responses_silence_skips_web_tools(
 
     class FakeRetriever:
         async def retrieve(self, *args, **kwargs):
-            return responses_route.empty_retrieval_result()
+            from xuwen.chat_api.companion_prompt import empty_retrieval_result
+
+            return empty_retrieval_result()
 
     class FakeRelationshipMemory:
         def load_markdown(self):
