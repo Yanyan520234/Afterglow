@@ -11,10 +11,15 @@ import pytest
 import respx
 from fastapi.testclient import TestClient
 
+from tests.integration.conftest import NoopProactiveContextCache, embedding_response
 from xuwen.chat_api.app import create_app
 from xuwen.chat_api.companion_prompt import empty_retrieval_result
 from xuwen.companion.life import LifeSnapshot
 from xuwen.config import Settings
+
+# 保持既有模块内名字：_embedding_response / _NoopProactiveContextCache
+_embedding_response = embedding_response
+_NoopProactiveContextCache = NoopProactiveContextCache
 
 
 @pytest.fixture()
@@ -57,11 +62,6 @@ def _embedding_response(req: httpx.Request) -> httpx.Response:
             "usage": {"prompt_tokens": 0, "total_tokens": 0},
         },
     )
-
-
-class _NoopProactiveContextCache:
-    async def append_turn(self, **_: object) -> None:
-        pass
 
 
 def test_info_endpoint(settings: Settings):
