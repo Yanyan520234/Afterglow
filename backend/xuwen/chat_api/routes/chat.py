@@ -39,7 +39,6 @@ from xuwen.chat_api.llm_client import GenerationParams
 from xuwen.chat_api.output_filter import AssistantOutputFilter, sanitize_assistant_text
 from xuwen.chat_api.proactive_activity import record_proactive_user_activity
 from xuwen.chat_api.schedule_extractor import extract_schedule_tasks
-from xuwen.ingestion.image_importer import _usable_image_description
 from xuwen.chat_api.schemas import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -70,6 +69,7 @@ from xuwen.config import Settings
 from xuwen.core.errors import RetrievalError, XuwenError
 from xuwen.core.models import HistoryImageChunk, RetrievalQuery
 from xuwen.core.time import local_now
+from xuwen.ingestion.image_importer import _usable_image_description
 from xuwen.memory.writer import WritebackTurn
 from xuwen.persona.prompt import ChatMessage as PromptMessage
 from xuwen.persona.prompt import build_chat_messages
@@ -78,6 +78,10 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["chat"])
 
 _CHAT_RELATIONSHIP_TIMEOUT_SECONDS = 5.0
+
+# 后台任务引用容器：asyncio 只保留弱引用，任务对象可能被 GC 提前回收中断执行。
+# 用模块级 set 强引用任务，完成后自动丢弃；避免 history_images 异步写入偶发丢失。
+_ACTIVE_BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
 
 
 class ChatTurnCancelRequest(BaseModel):
@@ -128,7 +132,7 @@ def _spawn_history_image_persist(
             friend_name = state.settings.friend_name or "对方"
             now = local_now()
             chunks: list[HistoryImageChunk] = []
-            for i, (sha, desc) in enumerate(zip(image_shas, vlm_descriptions)):
+            for i, (sha, desc) in enumerate(zip(image_shas, vlm_descriptions, strict=True)):
                 # 失败/占位描述（识别失败/超时/无描述）不写入长期记忆
                 if not _usable_image_description(desc):
                     continue
@@ -156,7 +160,7 @@ def _spawn_history_image_persist(
                 return
             texts = [c.description for c in chunks]
             embeddings = await state.embedder.embed_texts(texts)
-            emb_map = {c.chunk_id: vec for c, vec in zip(chunks, embeddings)}
+            emb_map = {c.chunk_id: vec for c, vec in zip(chunks, embeddings, strict=True)}
             await state.store.upsert_history_image_chunks(chunks, emb_map)
             state.metrics.record(
                 "history.images", 0.0, detail=f"trace={trace_id},chunks={len(chunks)}"
@@ -165,7 +169,9 @@ def _spawn_history_image_persist(
             logger.warning("history_images 异步写入失败", exc_info=True)
 
     try:
-        asyncio.create_task(_persist())
+        task = asyncio.create_task(_persist())
+        _ACTIVE_BACKGROUND_TASKS.add(task)
+        task.add_done_callback(_ACTIVE_BACKGROUND_TASKS.discard)
     except RuntimeError:
         # 事件循环关闭等极端情况，静默丢弃
         pass

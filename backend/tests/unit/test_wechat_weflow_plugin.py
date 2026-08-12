@@ -17,6 +17,7 @@ from typing import Any
 import pytest
 
 from xuwen.config import Settings
+from xuwen.core.errors import ParseError
 from xuwen.core.models import MessageKind, NormalizedMessage
 from xuwen.ingestion.parser import detect_plugin, parse_messages
 from xuwen.ingestion.plugins.wechat_weflow import WeChatWeFlowPlugin
@@ -244,7 +245,7 @@ def test_parse_skips_non_dict_messages() -> None:
 
 def test_parse_raises_when_messages_missing() -> None:
     plugin = WeChatWeFlowPlugin()
-    with pytest.raises(Exception):
+    with pytest.raises(ParseError):
         plugin.parse({"weflow": {"format": "arkme-json"}}, _settings())
 
 

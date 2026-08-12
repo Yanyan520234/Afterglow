@@ -12,10 +12,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
-
 from xuwen.web_ui.inspect_file import inspect_chat_file
-
 
 FIXTURES = Path(__file__).resolve().parent.parent / "fixtures"
 

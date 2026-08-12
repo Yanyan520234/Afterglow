@@ -20,7 +20,6 @@ from xuwen.ingestion.parser import detect_plugin, load_qq_json, parse_messages
 from xuwen.ingestion.plugins.douyin_chat_export import DouyinChatExportPlugin
 from xuwen.ingestion.splitter import build_windows, split_sessions
 
-
 FIXTURE = Path(__file__).resolve().parent.parent / "fixtures" / "sample_douyin_chatlab.json"
 
 
