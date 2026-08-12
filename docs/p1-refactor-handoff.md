@@ -1,9 +1,9 @@
-# P1 一期重构 · 交接报告（S0-S3 验收通过）
+# P1 一期重构 · 交接报告（S0-S6 全部完成）
 
 > 最后更新：2026-08-13 · 由上一次执行 agent 交接
 > 本文件是 P1 重构的**执行状态交接**，与 `docs/p1-refactor-plan.md`（计划书）配对。
-> **下一个接手 P1 的 agent 必须先读：1) 本交给（现状+已验证）→ 2) 计划书（目标+不变量）→ 3) 下方「S6 接力指南」。**
-> 验收结论见文末「七、验收记录」——S0-S3 全部可复现验证通过。
+> **下一个接手 P1 的 agent 必须先读：1) 本交给（现状+已验证）→ 2) 计划书（目标+不变量）→ 3) 下方「九、观察期接力指南」。**
+> 验收结论见文末「七、验收记录」——S0-S6 全部完成并已合入 main、打 v0.3.7。
 
 ---
 
@@ -11,10 +11,10 @@
 
 本仓库 `C:\Users\yang\clone bot\Afterglow` 正做 **P1 重构**：把 `chat.py` + `responses.py` 两条平行流水线收敛为「共享管道 `turn_service.py` + 薄适配层」，**行为零变化**。
 
-- 已完成：**S0 基线清理**、**PR1 parity 安全网（test_protocol_parity.py，6 项）**、**PR2 turn_service.py 骨架**、**PR3 收敛（S3：chat.py + responses.py 已切换共享管道）**
-- 下一步：**S6 合流**（全量+parity 绿 → 隐私守卫 → push myrepo `Yanyan520234/Afterglow` → 打 v0.3.7），随后进入一周观察期
-- 当前分支：`refactor/turn-service`（含 PR1+PR2+PR3，工作树干净）
-- **红线**：12 条不变量（计划书第 6 章）+ parity 套件全绿是唯一裁判；任何回归立即回退该步提交
+- 已完成：**S0 基线清理**、**PR1 parity 安全网（test_protocol_parity.py，6 项）**、**PR2 turn_service.py 骨架**、**PR3 收敛（S3：chat.py + responses.py 切换共享管道）**、**S6 合流（隐私守卫 → push myrepo → tag v0.3.7 → ff-only 合入 main）**
+- 下一步：**一周观察期**（真实运行零回归），之后立项 S4/S5/DEBUG_PARITY_DIFF
+- 当前分支：`main`（HEAD=5776e9d，本地与 myrepo 一致）；`refactor/turn-service` 已合并、与 main 同指针
+- **红线**：12 条不变量（计划书第 6 章）+ parity 套件全绿是唯一裁判；任何回归立即回退对应提交
 - 遗留待办（不属 P1）：mypy 20 个既有错误（P5 处理）、隐私守卫脚本化、CI mypy；`DEBUG_PARITY_DIFF` 指纹钩子与 `scripts/parity_diff.py`（决策 8）留观察期做双实现对拍
 
 ---
@@ -26,27 +26,28 @@
 | 引擎路径 | `C:\Users\yang\clone bot\Afterglow` |
 | 桥接路径 | `C:\Users\yang\clone bot\afterglow-onebot-bridge`（本轮未改动） |
 | 引擎 remote | `myrepo=Yanyan520234/Afterglow`（公众 fork）；`origin=kldhsh123/Afterglow`（上游，只读） |
-| 当前分支 | `refactor/turn-service` |
+| 当前分支 | `main`（S6 已快进合入 PR1+PR2+PR3） |
 | 工作树 | 干净，无未提交/未跟踪文件 |
-| tag | `legacy-pre-refactor`（指向 142cc79，即重构前的安全网状态） |
+| tag | `legacy-pre-refactor`（指向 142cc79，重构前安全网）；`v0.3.7`（重构落地标记） |
 
 ```
-提交历史（refactor/turn-service）：
-8fc7dca refactor(responses): responses.py 切换共享管道（增量3）  ← PR3 第三增量
+提交历史（main，S6 快进合并后 HEAD=5776e9d）：
+5776e9d docs(p1): PR3 完成交接 + S6 接力指南      ← main HEAD（本地 = myrepo）
+8fc7dca refactor(responses): responses.py 切换共享管道（增量3）
 a7bea03 refactor(chat): chat.py 切换共享 run_layer_a + decide_policy（增量2）
 a671b0f refactor(chat): chat.py 切换共享 persona_card + messages（增量1）
 00ab07f refactor(chat): 共享编排层纯搬迁          ← PR2
-142cc79 test(chat): 协议一致性安全网（先行）       ← PR1（已合入 main + 打了 tag）
+142cc79 test(chat): 协议一致性安全网（先行）       ← PR1（legacy-pre-refactor tag）
 b5b2918 S0 基线清理: ruff 修复 + P1 计划书入库
 2eab2af chore: 0.3.6 rebuild clean history
 ```
 
-分支关系：
-- `main` = 2eab2af → b5b2918 → 142cc79（**含 PR1，无 PR2/PR3**）
-- `refactor/turn-service` = main + [PR2 + PR3×3]（**含 PR1 + PR2 + PR3**）
-- 即：`git log main..refactor/turn-service` 为 `00ab07f`、`a671b0f`、`a7bea03`、`8fc7dca`（另加本文档提交）
+分支关系（S6 后）：
+- `main` = `refactor/turn-service` **ff-only 快进合并**结果（含 PR1+PR2+PR3+文档），HEAD=`5776e9d`，已推送 myrepo
+- `refactor/turn-service` 仍存在，与 main 指向同一提交（可删除，保留作历史亦可）
+- 上游 `origin/main`（`22835dfd`=v0.3.5）与 fork 血缘不同（fork 曾做 clean-history 重建），P1 全程不涉及上游同步
 
-> ⚠️ 提示：PR3 已完成于 `refactor/turn-service` 分支。**S6 合流时 PR2/PR3 一起快进/合入 main。**
+> ✅ S6 已于 2026-08-13 完成：隐私守卫通过 → push myrepo → tag `v0.3.7` → `git merge --ff-only refactor/turn-service` 合入 main 并推送（`main@5776e9d`）。
 
 ---
 
@@ -238,7 +239,7 @@ build_messages(state, *, persona_card, retrieved, recent, current_user_message,
 - pytest：`backend\.venv\Scripts\python.exe -m pytest tests/unit -q` 等
 - 后端进程：已有运行实例（8000 端口，若需重启用 `--reload` 启动）
 - **不要提交 `backend/.env`**（含真实 key）
-- `.gitconfig` 有 `gh-proxy` 镜像重写，push 到 myrepo 前**注释掉 insteadOf**（临时改，推完还原）
+- `.gitconfig` 的 `gh-proxy` insteadOf 重写**当前已处于注释状态**（本轮 push 直接走 https://github.com 成功，无需改动；若以后开启记得推完还原）
 
 ---
 
@@ -249,27 +250,42 @@ build_messages(state, *, persona_card, retrieved, recent, current_user_message,
 ✅ parity:          6/6 passed
 ✅ unit:            723 passed
 ✅ integration:     88 passed（含 test_chat_api 29 + test_protocol_parity 6 + 其余）
+✅ 全量复跑:        pytest tests/unit tests/integration = 811 passed（S6 终验）
 ✅ 工作树:          干净
-✅ tag legacy-pre-refactor: 已打（指向 142cc79）
-✅ 分支结构:        main 含 PR1；refactor/turn-service 含 PR1+PR2+PR3；工作树干净
+✅ tag:             legacy-pre-refactor（142cc79）+ v0.3.7（重构落地标记）
 ✅ 12 条不变量:     逐条核对保持（差异留在适配层 or 共享层参数化）
+✅ 隐私守卫:        git grep 无 QQ 号 / sk- 密钥 / 聊天导入 / lancedb 命中；
+                   backend/.env 已被 .gitignore 排除（git check-ignore 命中）
+✅ push:            refactor/turn-service + v0.3.7 + main 全部推送 myrepo
+✅ 合流:            git merge --ff-only refactor/turn-service → main（0 冲突，历史线性，main@5776e9d）
 ```
 
-**S0 / PR1 / PR2 / PR3（S3 收敛）全部验收通过。**
+**S0 / PR1 / PR2 / PR3（S3 收敛）/ S6（合流）全部完成。**
 
-## 八、S6 接力指南（下一步，从这里开始）
+## 八、S6 接力指南（已完成，存档）
 
-### 当前状态
-- 分支 `refactor/turn-service`，含 PR1+PR2+PR3（chat/responses 已收敛为共享管道 + 薄适配层），工作树干净
-- 下一步：**S6 合流**（计划书 §5）：全量 + parity 绿 → **隐私守卫** → **push myrepo `Yanyan520234/Afterglow`** → **打 v0.3.7**
+> ✅ **S6 已于 2026-08-13 完成**（全量 811 绿 + 隐私守卫通过 + push myrepo + tag v0.3.7 + ff-only 合入 main）。下列步骤为执行时方法论记录，历史有效；新 agent 不再需要从这里开始，去「九、观察期接力指南」。
 
-### S6 步骤（纪律）
-1. 最终验收：`python -m ruff check xuwen scripts tests` + `python -m pytest tests/unit tests/integration -q` 全绿
-2. **隐私守卫**（S6 强制关卡）：`git ls-files` / `git grep` 检查 QQ 号、真实密钥、聊天记录原始文本零命中；`backend/.env` 不入库（`.gitignore` 已排除，commit 前 `git status` 再核对）
-3. push 前 **临时注释 `.gitconfig` 的 `gh-proxy` insteadOf 重写**（推完还原）
-4. push：`git push myrepo refactor/turn-service`
-5. 打 tag：`git tag v0.3.7`（重构落地标记）+ push tag / 合 main
-6. 观察期（一周真实运行零回归）后立项：S4（SSE 拆文件）、S5（companion 复用 policy_service）、DEBUG_PARITY_DIFF ↔ `legacy-pre-refactor` 只读对拍
+### S6 步骤（执行记录）
+1. ✅ 最终验收：`python -m ruff check xuwen scripts tests` + `python -m pytest tests/unit tests/integration -q` → 811 全绿
+2. ✅ **隐私守卫**：`git ls-files` 仅 `.env.docker.example`/`backend/.env.example`（无真实 .env）；`git grep` QQ 号（2903132650/2118659720/3108640434/3199661702）、`sk-` 密钥、`.data`/`imports`/`lancedb`/`.jsonl` 聊天导入 **零命中**；`git check-ignore backend/.env` 命中
+3. ✅ `.gitconfig` `gh-proxy` insteadOf **已处于注释状态**，无需临时改动，直接 push 成功
+4. ✅ push：`git push myrepo refactor/turn-service`（新分支 5776e9d）
+5. ✅ 打 tag：`git tag -a v0.3.7` + `git push myrepo v0.3.7`
+6. ✅ 合流：`git checkout main && git merge --ff-only refactor/turn-service`（142cc79..5776e9d，0 冲突）+ `git push myrepo main`（远程 main=5776e9d）
+
+## 九、观察期接力指南（下一步，从这里开始）
+
+### 观察期（建议一周真实运行，零回归）
+- 发布版本为 **v0.3.7**（fork 重构落地标记），观察 chat / responses 行为无回归
+- 重点盯：检索失败（chat=504/503 / responses=降级）、VLM 描图（模板/预算差异）、schedule / need_owner / send_image、SSE 双线（`data:` vs `event:`）
+- 若回归 → 立即 revert 对应增量提交（PR2/PR3 各提交独立，可 cherry-pick / revert，见「五、PR3 接力指南」）
+
+### 观察期后立项（计划书 §5 / §8）
+- **S4**：SSE 拆 `sse_chat.py` / `sse_responses.py`（当前双线保留在适配层）
+- **S5**：companion.py 复用 policy_service（当前 companion 不经编排，不变量⑫）
+- **DEBUG_PARITY_DIFF**（决策 8）：`scripts/parity_diff.py` 打印 stage 指纹，与 `legacy-pre-refactor` tag 旧实现**只读对拍**，不跑双实现
+- **工程标准（P4/P5）**：隐私守卫脚本化 + pre-commit + CI mypy + 覆盖率
 
 ### 已知坑（延续）
 1. 检索错误：chat 立即 raise（504/503）/ responses 降级——共享层用 `retrieval_fail_open` 区分，**不要**把它统一掉

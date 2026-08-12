@@ -93,7 +93,7 @@ companion.py（1135，不动）
 | — | PR1 合后打 tag `legacy-pre-refactor` | — | ✅ done |
 | PR2 | S2 纯搬迁：turn_service 骨架 + 路由 re-export 保兼容；turn_coordinator 按决策 2 引用式吸收 | 全量 0 回归 | `refactor(chat): 共享编排层纯搬迁` |
 | PR3 | S3 收敛：按定稿 API 实现；"空结果不抛/错误抛 RetrievalError"；chat/responses 变薄；守 12 条不变量；修正测试耦合点 | 全量 + parity 绿 | `refactor(chat): 收敛共享管道+适配层` ✅ done（a671b0f / a7bea03 / 8fc7dca 增量） |
-| S6 | 全量 + parity 绿 → 隐私守卫 → push myrepo → 打 v0.3.7 | 全绿+守卫 | — |
+| S6 | 全量 + parity 绿 → 隐私守卫 → push myrepo → 打 v0.3.7 | 全绿+守卫 | ✅ done（main@5776e9d + v0.3.7 + ff 合入 main） |
 
 观察期（一周真实运行，零回归）→ 后续立项：
 - S4：SSE 拆 `sse_chat.py` / `sse_responses.py`
@@ -128,11 +128,11 @@ S3 若某条回归 → **立即回退该步提交，不掩盖**。
 - [x] PR1（parity 安全网）单提交 `142cc79`，已打 tag `legacy-pre-refactor`
 - [x] PR2（turn_service 骨架）单提交 `00ab07f`
 - [x] PR3（S3 收敛）3 个增量提交 `a671b0f` / `a7bea03` / `8fc7dca`（增量切换已拍板）+ 文档提交
-- [ ] S6：全量 + parity 绿 → 隐私守卫 → push myrepo → 打 v0.3.7
+- [x] S6 合流：隐私守卫通过 → push myrepo（分支+tag+main）→ 打 v0.3.7 → ff-only 合入 main（main@5776e9d）
 - [ ] 观察期一周零回归后：S4（SSE 拆文件）/ S5（companion 复用 policy_service）/ DEBUG_PARITY_DIFF ↔ `legacy-pre-refactor` 对拍立项
 - 每步提交遵循 Conventional Commits，且 ruff + mypy + pytest/parity 全绿才合
 - PR1/PR2/PR3 提交可独立 cherry-pick / revert
-- S6 push 前跑隐私守卫（git ls-files / git grep QQ、密钥、聊天标记零命中）
+- S6 隐私守卫已执行（QQ 号 / 密钥 / 聊天导入零命中；backend/.env gitignore 排除）
 - 完成后更新本节状态，交接给下一个执行者
 
 ---
