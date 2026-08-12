@@ -1,0 +1,258 @@
+"""陪伴状态、记忆与表情包相关的共享提示词辅助函数。"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from xuwen.chat_api.sticker_store import StickerStore, render_sticker_block_for_prompt
+from xuwen.companion.life import LifeSnapshot
+from xuwen.config import Settings
+from xuwen.core.models import RetrievalResult, ScoredChunk
+from xuwen.persona.card import load_persona_card
+from xuwen.persona.prompt import ChatMessage
+from xuwen.persona.style_profile import (
+    load_style_profile,
+    render_random_burst_block,
+    render_style_profile_for_query,
+)
+
+_PERSONA_CARD_BOUNDARY = """【画像使用边界】
+persona 画像是长期统计参考，不是今天发生的事实。
+回复优先级：当前生活状态 > 关系记忆 > 本轮检索到的真实回复样本 > persona 画像。
+不要凭画像或历史片段发明今天在想谁、怀疑用户、正在打游戏、现实见面、emoji 或亲密动作。
+画像中的“宝宝”“老婆”等亲密词是历史特定语境，不是普遍称呼，不要对当前用户使用。
+短句是聊天习惯，不是字数限制；讲笑话、解释、讲故事、正经说明等需要完整表达的场合要写完整，不要压缩成几个字。"""
+
+_LIFE_MARKER_INSTRUCTION = """【生活状态自更新（内部协议，不要向用户解释）】
+如果在这一轮回复中你的真实生活状态发生了变化（如吃饭/出门/睡觉/换活动/心情转变），
+在回复正文之后**追加**一个隐藏标记块，用一句自然语言说明变化：
+
+<life-event>准备去吃饭，接下来一会儿不方便立即回复</life-event>
+
+规则：
+- 没有真实变化时不要输出标记块；不要为了刷新状态而编造改变。
+- 标记块只能放在回复最后，且整体一次性输出，不要分散在正文中。
+- 只描述这轮回复已经明确成立的状态变化，不要写 JSON，不要补充回复正文未支持的事实。
+- 标记块会被后端剥离，再交给生活时间线模型归一化；用户看不到。"""
+
+_SCHEDULE_HINT_INSTRUCTION = """【定时任务（内部协议，不要向用户解释）】
+如果用户在本轮明确要求你"届时提醒/叫醒/通知"——例如：
+- "明天早上7点叫我起床"
+- "每天9点提醒我喝水"
+- "周一帮我提醒开会"
+- "10 分钟后告诉我一声"
+
+在正常回复之后**追加**一个隐藏标记块，用【自然中文】描述意图，不要自己计算时间格式：
+
+<schedule-hint>明天早上7点叫我起床</schedule-hint>
+
+规则：
+- 只在用户【明确请求】定时任务时才输出；闲聊或顺口提到时间不算。
+- 一轮可以有多个 `<schedule-hint>` 块（用户一次说了多个任务）。
+- 标记块里**只写自然语言**，不要写 ISO 时间 / cron / RRULE——后端有专门的小模型负责解析。
+- 标记块会被后端剥离，用户看不到；正文里请正常用自然语气答复用户已收到这个请求。"""
+
+
+def empty_retrieval_result() -> RetrievalResult:
+    return RetrievalResult(
+        friend_examples=[],
+        dialogue_windows=[],
+        history_images=[],
+        recent_live=[],
+        response_pairs=[],
+        fused=[],
+    )
+
+
+def build_persona_card_with_companion_context(
+    *,
+    settings: Settings,
+    life: LifeSnapshot,
+    relationship_context: str,
+    style_query: str = "",
+    response_policy_context: str = "",
+    include_schedule_hint: bool = False,
+) -> str:
+    """加载人格卡片，并追加高优先级的陪伴上下文。
+
+    `include_schedule_hint`：是否注入 <schedule-hint> 内部协议指引。
+    只有真正会调用 schedule_extractor 并把结果回传给客户端的路由（目前仅
+    routes/chat.py 的 ChatCompletions）才应传 True。Responses API / 主动话题
+    等路由若也开启该指引，AI 会输出 hint 但调用方拿不到 schedule_tasks，
+    任务会被静默丢失（Finding 5）。
+    """
+    persona_card = load_persona_card(settings.persona_data_dir / "persona_card.md")
+    blocks = [_PERSONA_CARD_BOUNDARY]
+    style_profile = load_style_profile(settings.persona_data_dir / "persona_style_profile.json")
+    style_block = render_style_profile_for_query(style_profile, style_query)
+    if style_block:
+        blocks.append(style_block)
+    random_burst_block = render_random_burst_block(style_profile, style_query)
+    if random_burst_block:
+        blocks.append(random_burst_block)
+    blocks.append(life.render_prompt_block())
+    if relationship_context:
+        blocks.append(relationship_context)
+    personality_context = load_personality_prompt_context(settings)
+    if personality_context:
+        blocks.append(personality_context)
+    experimental_context = load_experimental_prompt_context(settings)
+    if experimental_context:
+        blocks.append(experimental_context)
+    aliases_block = _render_aliases_block(settings)
+    if aliases_block:
+        blocks.append(aliases_block)
+    if response_policy_context:
+        # 决策块放在最后，优先级最高（主模型读到这里时已经看完所有上下文）。
+        blocks.append(response_policy_context)
+    if settings.life_marker_update_enabled:
+        blocks.append(_LIFE_MARKER_INSTRUCTION)
+    if include_schedule_hint and settings.schedule_extract_enabled:
+        blocks.append(_SCHEDULE_HINT_INSTRUCTION)
+
+    sticker_store = StickerStore(settings)
+    sticker_block = render_sticker_block_for_prompt(sticker_store.available_for_ai())
+    if sticker_block:
+        blocks.append(sticker_block)
+
+    return (persona_card + "\n\n" + "\n\n".join(blocks)).strip()
+
+
+def load_personality_prompt_context(settings: Settings) -> str:
+    """按独立开关读取去证据的普通人格画像。"""
+    if not settings.analysis_personality_prompt_enabled:
+        return ""
+    path = Path(settings.analysis_data_dir) / "personality_prompt_context.md"
+    try:
+        content = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+    return content[:12000]
+
+
+def load_experimental_prompt_context(settings: Settings) -> str:
+    """仅在双开关开启时读取去证据的实验人格画像。"""
+    if not (
+        settings.analysis_experimental_enabled
+        and settings.analysis_experimental_prompt_enabled
+    ):
+        return ""
+    path = Path(settings.analysis_data_dir) / "experimental" / "prompt_context.md"
+    try:
+        content = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+    return content[:12000]
+
+
+def render_life_memory_context(
+    retrieved: RetrievalResult,
+    settings: Settings,
+    *,
+    max_items: int = 8,
+) -> str:
+    """压缩检索到的历史记录，供生活状态控制器使用。
+
+    生活状态模型应从中学习偏好和语气，不应把这些内容当作今天已经发生之事的证据。
+    """
+    lines: list[str] = []
+    seen: set[str] = set()
+    for chunk in [
+        *retrieved.response_pairs,
+        *retrieved.friend_examples,
+        *retrieved.dialogue_windows,
+        *retrieved.history_images,
+    ]:
+        line = _life_memory_line(chunk, settings)
+        if not line or line in seen:
+            continue
+        lines.append(line)
+        seen.add(line)
+        if len(lines) >= max_items:
+            break
+    if not lines:
+        return ""
+    return "\n".join(lines)
+
+
+def render_life_memory_context_from_recent(
+    recent: list[ChatMessage],
+    settings: Settings,
+    *,
+    max_items: int = 8,
+) -> str:
+    """用最近几轮对话渲染 life 模型的 memory_context。
+
+    与 render_life_memory_context（基于 retrieved）的区别：
+    - 不依赖向量检索结果，可以和 retrieve 并发执行
+    - 内容是真实最近对话，对"AI 当前该是什么状态"判断同样有效
+    - 缺失的只是"与当前 query 语义相似的历史片段"，但 life 决策核心信号
+      （时间/作息/上一次状态/用户输入）都不在那里
+    """
+    if not recent:
+        return ""
+    self_name = settings.self_name or "用户"
+    friend_name = settings.friend_name or "TA"
+    lines: list[str] = []
+    # 取最近 max_items 条，按时间序展示
+    for msg in recent[-max_items:]:
+        text = (msg.content or "").strip()
+        if not text:
+            continue
+        speaker = self_name if msg.role == "user" else friend_name
+        lines.append(f"- {speaker}: {_short(text, 140)}")
+    if not lines:
+        return ""
+    return "\n".join(lines)
+
+
+def _life_memory_line(chunk: ScoredChunk, settings: Settings) -> str:
+    self_name = settings.self_name or "用户"
+    friend_name = settings.friend_name or "TA"
+    if chunk.kind == "response_pair":
+        user_text = str(chunk.metadata.get("text") or "").strip()
+        friend_reply = str(chunk.metadata.get("friend_reply") or "").strip()
+        if user_text and friend_reply:
+            return f"- 当 {self_name} 说「{_short(user_text)}」时，{friend_name} 曾回「{_short(friend_reply)}」"
+    text = (chunk.metadata.get("dialogue_snippet") or chunk.text or "").strip()
+    if not text:
+        return ""
+    return f"- 历史片段：{_short(str(text), 140)}"
+
+
+def _short(text: str, limit: int = 80) -> str:
+    cleaned = " ".join(text.split())
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: limit - 1] + "…"
+
+
+def _render_aliases_block(settings: Settings) -> str:
+    """渲染"你和对方的别名"教学块。
+
+    当没有任何别名时返回空，避免给主模型增加无意义的上下文。
+    """
+    friend_names = settings.all_friend_names
+    self_names = settings.all_self_names
+    if not (len(friend_names) > 1 or len(self_names) > 1):
+        return ""
+
+    lines = ["【你和对方的别名（重要，否则会闹笑话）】"]
+    if len(friend_names) > 1:
+        primary = friend_names[0]
+        others = "、".join(friend_names[1:])
+        lines.append(
+            f"- 你（{primary}）也会被用户这样称呼：{others}。"
+            "看到这些名字时不要追问\"...是谁\"，那都是叫你。"
+        )
+    if len(self_names) > 1:
+        primary = self_names[0]
+        others = "、".join(self_names[1:])
+        lines.append(
+            f"- 用户（{primary}）也可能被叫成：{others}。"
+            "你可以根据语境选用其中一个名字回应；不要刻意频繁切换。"
+        )
+    lines.append(
+        "- 历史记忆里如果出现这些别名，都按真人对话理解，不要把同一个人当成两个人。"
+    )
+    return "\n".join(lines)

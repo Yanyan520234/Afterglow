@@ -1,0 +1,1181 @@
+"""/v1/responses：OpenAI Responses API 兼容端点（中等子集）。
+
+支持：input(str / message array / 含多模态 input_image)、instructions、stream、
+temperature / top_p / max_output_tokens、previous_response_id（LRU 缓存）、conversation_id。
+
+不支持：tools / function_call / file inputs / image_generation / code_interpreter /
+MCP / background mode。
+
+model 字段是 OpenAI 协议占位，实际使用 .env 的 CHAT_MODEL。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import time
+import uuid
+from collections.abc import AsyncIterator, Callable
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import StreamingResponse
+
+from xuwen.chat_api.chat_pipeline import (
+    available_sticker_names,
+    build_policy_hint,
+    build_sticker_retry_hint,
+    effective_reply_delay_seconds,
+    effective_silence_sentinel,
+    extract_life_events,
+    fallback_for_rejected_sticker,
+    is_ai_silence_signal,
+    looks_like_sticker_only_intent,
+    schedule_life_events,
+)
+from xuwen.chat_api.companion_prompt import (
+    build_persona_card_with_companion_context,
+    empty_retrieval_result,
+    render_life_memory_context_from_recent,
+)
+from xuwen.chat_api.image_store import ImageError, save_data_url
+from xuwen.chat_api.llm_client import GenerationParams
+from xuwen.chat_api.output_filter import AssistantOutputFilter, sanitize_assistant_text
+from xuwen.chat_api.proactive_activity import record_proactive_user_activity
+from xuwen.chat_api.responses_store import ResponseRecord
+from xuwen.chat_api.schemas import (
+    PolicyHint,
+    ResponsesInputImageContent,
+    ResponsesInputMessage,
+    ResponsesInputTextContent,
+    ResponsesOutputMessage,
+    ResponsesOutputTextContent,
+    ResponsesRequest,
+    ResponsesResponse,
+    ResponsesUsage,
+)
+from xuwen.chat_api.state import AppState, get_state
+from xuwen.chat_api.vision_client import VisionClient
+from xuwen.chat_api.web_fetch import render_url_context, resolve_fetch_urls
+from xuwen.chat_api.web_search import render_web_context, should_search_web
+from xuwen.companion.life import LifeSnapshot
+from xuwen.companion.response_policy import (
+    ResponseDecision,
+    decide_response_policy,
+    refine_decision_with_llm,
+)
+from xuwen.core.errors import RetrievalError, XuwenError
+from xuwen.core.models import RetrievalQuery
+from xuwen.memory.writer import WritebackTurn
+from xuwen.persona.prompt import ChatMessage as PromptMessage
+from xuwen.persona.prompt import build_chat_messages
+
+logger = logging.getLogger(__name__)
+router = APIRouter(tags=["responses"])
+
+_RESPONSES_RELATIONSHIP_TIMEOUT_SECONDS = 5.0
+
+
+@router.post("/v1/responses", response_model=None)
+async def responses(
+    req: ResponsesRequest,
+    request: Request,
+    state: AppState = Depends(get_state),
+) -> StreamingResponse | ResponsesResponse:
+    trace_id = str(getattr(request.state, "request_id", "") or "")
+
+    history, last_user_text, last_user_images = _normalize_input(req)
+
+    conversation_id = req.conversation_id
+    if conversation_id is None and req.previous_response_id:
+        prev = state.responses_store.get(req.previous_response_id)
+        if prev is not None and prev.conversation_id:
+            conversation_id = prev.conversation_id
+
+    image_shas: list[str] = []
+    vlm_descriptions: list[str] = []
+    if last_user_images:
+        if not state.settings.vision_enabled:
+            raise HTTPException(
+                status_code=400,
+                detail="未启用视觉理解。请在后端 .env 设置 VISION_ENABLED=true。",
+            )
+        for url in last_user_images:
+            try:
+                ref = save_data_url(url, state.settings)
+            except ImageError as e:
+                raise HTTPException(status_code=400, detail=e.message) from e
+            image_shas.append(ref.sha)
+        if not state.settings.chat_model_supports_vision:
+            if (
+                not state.settings.vision_api_url
+                or not state.settings.vision_api_key.get_secret_value()
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="主模型不支持视觉，且 VISION_API_URL / VISION_API_KEY 未配置。",
+                )
+            try:
+                async with VisionClient(state.settings) as vc:
+                    vlm_descriptions = await asyncio.wait_for(
+                        vc.describe_images(last_user_images),
+                        timeout=state.settings.vision_timeout_seconds,
+                    )
+            except TimeoutError:
+                logger.warning(
+                    "Responses VLM 描图超时 %.1fs，使用占位描述",
+                    state.settings.vision_timeout_seconds,
+                )
+                state.metrics.record("responses.vision.describe", 0.0, error="TimeoutError")
+                vlm_descriptions = ["[图片：识别超时]"] * len(last_user_images)
+            except Exception:
+                logger.warning("Responses VLM 描图失败，使用占位描述", exc_info=True)
+                state.metrics.record("responses.vision.describe", 0.0, error="Exception")
+                vlm_descriptions = ["[图片：识别失败]"] * len(last_user_images)
+
+    recent = history
+    current_user_text = (last_user_text or "").strip()
+    if current_user_text or last_user_images:
+        await record_proactive_user_activity(state, conversation_id)
+    if vlm_descriptions:
+        desc_block = "\n".join(
+            f"[图片{i + 1}描述：{d}]" for i, d in enumerate(vlm_descriptions)
+        )
+        current_user_text = (current_user_text + "\n" + desc_block).strip()
+
+    retrieval_query = current_user_text if current_user_text else "（用户发了一张图片）"
+    _retrieval_start = time.perf_counter()
+
+    async def _retrieve_with_metrics() -> Any:
+        try:
+            result = await asyncio.wait_for(
+                state.retriever.retrieve(
+                    RetrievalQuery(
+                        query_text=retrieval_query,
+                        conversation_id=conversation_id,
+                    ),
+                    metrics=state.metrics,
+                    trace_id=trace_id,
+                ),
+                timeout=state.settings.retrieval_timeout_seconds,
+            )
+            state.metrics.record(
+                "retrieval",
+                (time.perf_counter() - _retrieval_start) * 1000,
+                detail=f"final={len(result.fused)}",
+            )
+            return result
+        except TimeoutError:
+            logger.warning(
+                "Responses 检索超时 %.1fs，降级到无 RAG 模式",
+                state.settings.retrieval_timeout_seconds,
+            )
+            state.metrics.record("retrieval", 0.0, error="TimeoutError")
+            return empty_retrieval_result()
+        except RetrievalError as e:
+            logger.warning("检索失败，降级到无 RAG 模式：%s", e.message)
+            state.metrics.record(
+                "retrieval",
+                (time.perf_counter() - _retrieval_start) * 1000,
+                error=type(e).__name__,
+            )
+            return empty_retrieval_result()
+
+    async def _web_search_or_skip() -> str:
+        if state.web_search is None or not should_search_web(current_user_text):
+            return ""
+        try:
+            results = await state.web_search.search(
+                current_user_text,
+                trace_id=trace_id,
+                metrics=state.metrics,
+            )
+            return render_web_context(results)
+        except Exception:
+            logger.warning("web_search 调用失败", exc_info=True)
+            return ""
+
+    async def _resolve_urls_or_skip() -> list[str]:
+        if state.web_fetch is None:
+            return []
+        try:
+            return await resolve_fetch_urls(
+                current_user_text,
+                llm=state.life_llm,
+                model=state.settings.resolved_life_model,
+                limit=state.settings.web_fetch_max_urls,
+                trace_id=trace_id,
+                metrics=state.metrics,
+            )
+        except Exception:
+            logger.warning("resolve_fetch_urls 失败", exc_info=True)
+            return []
+
+    # life 进 Layer A 并发：memory_context 改用 recent，relationship_context 同步读 markdown
+    life_markdown = state.relationship_memory.load_markdown()
+
+    async def _life_in_parallel() -> LifeSnapshot:
+        async with state.life_apply_lock:
+            try:
+                return await asyncio.wait_for(
+                    state.life.decide_for_turn(
+                        llm=state.life_llm,
+                        model=state.settings.resolved_life_model,
+                        current_user_text=current_user_text,
+                        recent=recent,
+                        relationship_context=life_markdown,
+                        memory_context=render_life_memory_context_from_recent(recent, state.settings),
+                        trigger="responses",
+                        trace_id=trace_id,
+                        metrics=state.metrics,
+                    ),
+                    timeout=state.settings.life_timeout_seconds,
+                )
+            except TimeoutError:
+                logger.warning(
+                    "Responses life 决策超时 %.1fs，沿用当前 snapshot",
+                    state.settings.life_timeout_seconds,
+                )
+                state.metrics.record("responses.life.decide", 0.0, error="TimeoutError")
+                return state.life.snapshot()
+
+    async def _relationship_context_or_empty() -> str:
+        try:
+            return await asyncio.wait_for(
+                state.relationship_memory.render_context(
+                    retrieval_query,
+                    include_relevant=False,
+                    metrics=state.metrics,
+                    trace_id=trace_id,
+                ),
+                timeout=_RESPONSES_RELATIONSHIP_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            logger.warning(
+                "Responses 关系记忆渲染超时 %.1fs，降级为空上下文",
+                _RESPONSES_RELATIONSHIP_TIMEOUT_SECONDS,
+            )
+            state.metrics.record("responses.relationship.context", 0.0, error="TimeoutError")
+            return ""
+        except Exception:
+            logger.warning("Responses 关系记忆渲染失败，降级为空上下文", exc_info=True)
+            state.metrics.record("responses.relationship.context", 0.0, error="Exception")
+            return ""
+
+    # Layer A：只放"无论是否回复都需要"的预决策任务（检索 / 关系记忆 / life）。
+    # Web Search / URL Resolve 涉及外部 API 调用 + 用户隐私文本外发，必须等 decision
+    # 确认 should_reply=True 才能启动；否则用户说"别回我"也会触发搜索调用（隐私 + 费用泄漏）。
+    retrieved, relationship_block, life = await asyncio.gather(
+        _retrieve_with_metrics(),
+        _relationship_context_or_empty(),
+        _life_in_parallel(),
+    )
+
+    # model 字段占位：永远用 .env 的 CHAT_MODEL
+    model_name = state.settings.chat_model
+
+    # fetch_many 依赖 fetch_urls；定义函数体，等 silence 决策确认后再启动
+    async def _fetch_many_or_skip(urls: list[str]) -> str:
+        if not urls or state.web_fetch is None:
+            return ""
+        try:
+            url_results = await state.web_fetch.fetch_many(
+                urls,
+                trace_id=trace_id,
+                metrics=state.metrics,
+            )
+            return render_url_context(url_results)
+        except Exception:
+            logger.warning("fetch_many 失败", exc_info=True)
+            return ""
+
+    decision = decide_response_policy(
+        current_user_text=current_user_text,
+        has_images=bool(last_user_images),
+        retrieved=retrieved,
+        life=life,
+        relationship_context=relationship_block,
+        recent=recent,
+    )
+    state.metrics.record(
+        "response.policy",
+        0.0,
+        detail=f"trace={trace_id},{decision.metric_detail()}",
+    )
+    if state.settings.response_policy_model_enabled:
+        try:
+            decision = await asyncio.wait_for(
+                refine_decision_with_llm(
+                    base=decision,
+                    llm=state.response_policy_llm,
+                    model=state.settings.resolved_response_policy_model,
+                    settings=state.settings,
+                    current_user_text=current_user_text,
+                    recent=recent,
+                    life=life,
+                    relationship_context=relationship_block,
+                    has_images=bool(last_user_images),
+                    trace_id=trace_id,
+                    metrics=state.metrics,
+                ),
+                timeout=state.settings.response_policy_timeout_seconds,
+            )
+        except TimeoutError:
+            logger.warning(
+                "Responses 互动策略小模型超时 %.1fs，沿用规则层决策",
+                state.settings.response_policy_timeout_seconds,
+            )
+            state.metrics.record("response.policy.refined", 0.0, error="TimeoutError")
+        state.metrics.record(
+            "response.policy.refined",
+            0.0,
+            detail=f"trace={trace_id},{decision.metric_detail()}",
+        )
+    reply_delay_seconds = effective_reply_delay_seconds(
+        life=life,
+        decision=decision,
+        settings=state.settings,
+    )
+    policy_hint = build_policy_hint(
+        decision,
+        reply_delay_seconds=reply_delay_seconds,
+        reply_delay_reason=life.reply_delay_reason,
+    )
+    response_id = _new_response_id()
+
+    # silence 短路：放在 web/url 调用之前，避免用户说"别说话"还把消息发到搜索 / URL 解析端
+    if not decision.should_reply:
+        sentinel = state.settings.silence_response_sentinel
+        if conversation_id and (current_user_text or image_shas):
+            await state.writeback.enqueue_turn(
+                WritebackTurn(
+                    conversation_id=conversation_id,
+                    user_text=current_user_text,
+                    assistant_text="",
+                    user_image_shas=image_shas,
+                )
+            )
+        await state.proactive_context_cache.append_turn(
+            caller_id=None,
+            conversation_id=conversation_id,
+            user_text=current_user_text,
+            assistant_text="",
+        )
+        state.metrics.record(
+            "responses.silenced",
+            0.0,
+            detail=f"trace={trace_id},{decision.metric_detail()}",
+        )
+        if req.stream:
+            return StreamingResponse(
+                _stream_silenced(
+                    response_id=response_id,
+                    model_name=model_name,
+                    trace_id=trace_id,
+                    sentinel=sentinel,
+                    policy=policy_hint,
+                    previous_response_id=req.previous_response_id,
+                ),
+                media_type="text/event-stream",
+            )
+        state.responses_store.put(
+            ResponseRecord(
+                response_id=response_id,
+                conversation_id=conversation_id,
+                user_text=current_user_text,
+                assistant_text="",
+                created_at=int(time.time()),
+                model=model_name,
+            )
+        )
+        return _build_completed_response(
+            response_id=response_id,
+            model_name=model_name,
+            text=sentinel,
+            policy=policy_hint,
+            trace_id=trace_id,
+            previous_response_id=req.previous_response_id,
+        )
+
+    # Layer B：decision 确认要回复后才并发跑 Web Search + URL Resolve。
+    # fetch_many 依赖 fetch_urls，依旧 fire-and-forget 让它在 prompt 组装 / LLM 调用前完成。
+    web_context, fetch_urls = await asyncio.gather(
+        _web_search_or_skip(),
+        _resolve_urls_or_skip(),
+    )
+    fetch_many_task: asyncio.Task[str] = asyncio.create_task(_fetch_many_or_skip(fetch_urls))
+
+    persona_card = build_persona_card_with_companion_context(
+        settings=state.settings,
+        life=life,
+        relationship_context=relationship_block,
+        style_query=current_user_text,
+        response_policy_context=decision.render_prompt_block(
+            silence_sentinel=effective_silence_sentinel(state.settings),
+        ),
+    )
+    # 等 Layer B 起的 fetch_many 跑完。如果 prompt 组装已盖住 fetch RTT，这里 await 接近 0ms。
+    url_context = await fetch_many_task
+
+    messages = build_chat_messages(
+        settings=state.settings,
+        persona_card=persona_card,
+        retrieved=retrieved,
+        recent=recent,
+        current_user_message=current_user_text or "（图片）",
+        web_context=web_context,
+        url_context=url_context,
+    )
+
+    if (
+        last_user_images
+        and state.settings.chat_model_supports_vision
+        and messages
+        and messages[-1]["role"] == "user"
+    ):
+        text_for_user = messages[-1]["content"]
+        if isinstance(text_for_user, str):
+            mm_content: list[dict[str, Any]] = [{"type": "text", "text": text_for_user}]
+            for url in last_user_images:
+                mm_content.append({"type": "image_url", "image_url": {"url": url}})
+            messages[-1] = {"role": "user", "content": mm_content}  # type: ignore[dict-item]
+
+    params = GenerationParams(
+        temperature=req.temperature,
+        top_p=req.top_p,
+        max_tokens=req.max_output_tokens,
+    )
+
+    if req.stream and state.settings.response_streaming_enabled:
+        return StreamingResponse(
+            _stream_response(
+                state=state,
+                response_id=response_id,
+                messages=messages,
+                params=params,
+                model_name=model_name,
+                conversation_id=conversation_id,
+                user_text=current_user_text,
+                image_shas=image_shas,
+                trace_id=trace_id,
+                policy=policy_hint,
+                previous_response_id=req.previous_response_id,
+                decision=decision,
+            ),
+            media_type="text/event-stream",
+        )
+
+    _llm_start = time.perf_counter()
+    try:
+        raw_assistant_text = await state.llm.complete_chat(
+            messages,
+            params,
+            model=model_name,
+            trace_id=trace_id,
+            stage="responses.complete",
+            metrics=state.metrics,
+        )
+        life_extraction = extract_life_events(raw_assistant_text)
+        stripped = life_extraction.text
+        accepted_life_events = life_extraction.events
+        valid_names = available_sticker_names(state.settings)
+        assistant_text = sanitize_assistant_text(
+            stripped,
+            valid_sticker_names=valid_names,
+        )
+        # AI 自主沉默：主模型严格输出 sentinel → 转沉默路径，跳过 sticker 兜底。
+        ai_silenced = is_ai_silence_signal(
+            assistant_text,
+            sentinel=effective_silence_sentinel(state.settings),
+            decision=decision,
+        )
+        if ai_silenced:
+            state.metrics.record(
+                "responses.silenced.ai",
+                0.0,
+                detail=f"trace={trace_id},{decision.metric_detail()}",
+            )
+        # 同 chat.py：模型只发了不存在 sticker → 先 retry，失败再退到短句
+        if (
+            not ai_silenced
+            and assistant_text in {"嗯", ""}
+            and looks_like_sticker_only_intent(stripped)
+        ):
+            retried = False
+            if state.settings.sticker_reject_retry and valid_names is not None:
+                hint = build_sticker_retry_hint(stripped, valid_names)
+                retry_messages = [
+                    *messages,
+                    {"role": "system", "content": hint},
+                ]
+                try:
+                    retry_raw = await state.llm.complete_chat(
+                        retry_messages,
+                        params,
+                        model=model_name,
+                        trace_id=trace_id,
+                        stage="responses.complete.sticker_retry",
+                        metrics=state.metrics,
+                    )
+                    retry_extraction = extract_life_events(retry_raw)
+                    retry_stripped = retry_extraction.text
+                    retry_text = sanitize_assistant_text(
+                        retry_stripped,
+                        valid_sticker_names=valid_names,
+                    )
+                    if retry_text and retry_text != "嗯" and not looks_like_sticker_only_intent(
+                        retry_stripped
+                    ):
+                        assistant_text = retry_text
+                        accepted_life_events = retry_extraction.events
+                        retried = True
+                        state.metrics.record(
+                            "responses.sticker.retry_ok",
+                            0.0,
+                            detail=f"trace={trace_id},mode={decision.reply_mode}",
+                        )
+                except Exception:
+                    logger.warning("sticker retry 失败，回退到短句兜底", exc_info=True)
+            if not retried:
+                accepted_life_events = ()
+                assistant_text = (
+                    fallback_for_rejected_sticker(decision.reply_mode) or assistant_text
+                )
+                state.metrics.record(
+                    "responses.sticker.rejected",
+                    0.0,
+                    detail=f"trace={trace_id},mode={decision.reply_mode}",
+                )
+        state.metrics.record(
+            "llm.complete",
+            (time.perf_counter() - _llm_start) * 1000,
+            detail=model_name,
+        )
+    except XuwenError as e:
+        state.metrics.record(
+            "llm.complete",
+            (time.perf_counter() - _llm_start) * 1000,
+            error=e.code,
+        )
+        raise
+
+    if not ai_silenced:
+        schedule_life_events(
+            accepted_life_events,
+            state.life,
+            enabled=state.settings.life_marker_update_enabled,
+            llm=state.life_llm,
+            model=state.settings.resolved_life_model,
+            apply_lock=state.life_apply_lock,
+            pending_tasks=state.pending_life_tasks,
+            assistant_text=assistant_text,
+            current_user_text=current_user_text,
+            trace_id=trace_id,
+            metrics=state.metrics,
+        )
+
+    if conversation_id:
+        await state.writeback.enqueue_turn(
+            WritebackTurn(
+                conversation_id=conversation_id,
+                user_text=current_user_text,
+                # 沉默时写空 assistant_text，与规则层 silence 短路一致。
+                assistant_text="" if ai_silenced else assistant_text,
+                user_image_shas=image_shas,
+            )
+        )
+        await _remember_relationship_turn(
+            state,
+            conversation_id=conversation_id,
+            decision=decision,
+            trace_id=trace_id,
+        )
+    await state.proactive_context_cache.append_turn(
+        caller_id=None,
+        conversation_id=conversation_id,
+        user_text=current_user_text,
+        assistant_text="" if ai_silenced else assistant_text,
+    )
+
+    state.responses_store.put(
+        ResponseRecord(
+            response_id=response_id,
+            conversation_id=conversation_id,
+            user_text=current_user_text,
+            assistant_text="" if ai_silenced else assistant_text,
+            created_at=int(time.time()),
+            model=model_name,
+        )
+    )
+
+    # 假流式：stream=true 但后端不启用真流式 → 把完整 assistant_text 包装成
+    # 完整事件序列（一个 output_text.delta 含全部内容）发出。
+    # 沉默时切到 _stream_silenced，与规则层 silence 短路保持一致。
+    if req.stream:
+        if ai_silenced:
+            return StreamingResponse(
+                _stream_silenced(
+                    response_id=response_id,
+                    model_name=model_name,
+                    trace_id=trace_id,
+                    sentinel=state.settings.silence_response_sentinel,
+                    policy=policy_hint,
+                    previous_response_id=req.previous_response_id,
+                ),
+                media_type="text/event-stream",
+            )
+        return StreamingResponse(
+            _pseudo_stream_events(
+                response_id=response_id,
+                model_name=model_name,
+                trace_id=trace_id,
+                assistant_text=assistant_text,
+                policy=policy_hint,
+                previous_response_id=req.previous_response_id,
+            ),
+            media_type="text/event-stream",
+        )
+
+    return _build_completed_response(
+        response_id=response_id,
+        model_name=model_name,
+        text=assistant_text,
+        policy=policy_hint,
+        trace_id=trace_id,
+        previous_response_id=req.previous_response_id,
+    )
+
+
+async def _pseudo_stream_events(
+    *,
+    response_id: str,
+    model_name: str,
+    trace_id: str,
+    assistant_text: str,
+    policy: PolicyHint,
+    previous_response_id: str | None,
+) -> AsyncIterator[bytes]:
+    """假流式：把完整 assistant_text 按 Responses 事件协议一次性包装发出。"""
+    format_event = _new_event_formatter()
+    created_at = int(time.time())
+    message_id = _new_message_id()
+    base_response = {
+        "id": response_id,
+        "object": "response",
+        "created_at": created_at,
+        "model": model_name,
+        "status": "in_progress",
+        "output": [],
+        "trace_id": trace_id,
+        "policy": policy.model_dump(),
+        "previous_response_id": previous_response_id,
+    }
+    yield format_event("response.created", {"response": base_response})
+    yield format_event("response.in_progress", {"response": base_response})
+    item = {
+        "id": message_id,
+        "type": "message",
+        "role": "assistant",
+        "status": "in_progress",
+        "content": [],
+    }
+    yield format_event(
+        "response.output_item.added",
+        {"output_index": 0, "item": item},
+    )
+    content_part = {"type": "output_text", "text": "", "annotations": []}
+    yield format_event(
+        "response.content_part.added",
+        {"item_id": message_id, "output_index": 0, "content_index": 0, "part": content_part},
+    )
+    if assistant_text:
+        yield format_event(
+            "response.output_text.delta",
+            {"item_id": message_id, "output_index": 0, "content_index": 0, "delta": assistant_text},
+        )
+    yield format_event(
+        "response.output_text.done",
+        {"item_id": message_id, "output_index": 0, "content_index": 0, "text": assistant_text},
+    )
+    final_part = {**content_part, "text": assistant_text}
+    yield format_event(
+        "response.content_part.done",
+        {"item_id": message_id, "output_index": 0, "content_index": 0, "part": final_part},
+    )
+    final_item = {**item, "status": "completed", "content": [final_part]}
+    yield format_event(
+        "response.output_item.done",
+        {"output_index": 0, "item": final_item},
+    )
+    completed = {
+        **base_response,
+        "status": "completed",
+        "output": [final_item],
+        "output_text": assistant_text,
+        "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+    }
+    yield format_event("response.completed", {"response": completed})
+    yield b"data: [DONE]\n\n"
+
+
+# ---------------------------------------------------------------------------
+# 内部
+# ---------------------------------------------------------------------------
+
+
+def _normalize_input(req: ResponsesRequest) -> tuple[list[PromptMessage], str, list[str]]:
+    """把 Responses 协议的 input + instructions 平整为内部 PromptMessage 列表。"""
+    messages: list[ResponsesInputMessage] = []
+    if req.instructions:
+        messages.append(
+            ResponsesInputMessage(role="system", content=req.instructions),
+        )
+    if isinstance(req.input, str):
+        messages.append(ResponsesInputMessage(role="user", content=req.input))
+    else:
+        messages.extend(req.input)
+
+    user_indices = [i for i, m in enumerate(messages) if m.role == "user"]
+    if not user_indices:
+        raise HTTPException(status_code=400, detail="input 中至少要有一条 role=user")
+    last_user_idx = user_indices[-1]
+    last_user = messages[last_user_idx]
+    last_user_text, last_user_images = _extract_text_and_images(last_user)
+
+    history: list[PromptMessage] = []
+    for i, m in enumerate(messages):
+        if i == last_user_idx:
+            continue
+        if m.role not in {"system", "user", "assistant", "developer"}:
+            continue
+        role = "system" if m.role == "developer" else m.role
+        text, _ = _extract_text_and_images(m)
+        if not text and role != "system":
+            continue
+        history.append(PromptMessage(role=role, content=text))
+    return history, last_user_text, last_user_images
+
+
+def _extract_text_and_images(msg: ResponsesInputMessage) -> tuple[str, list[str]]:
+    if isinstance(msg.content, str):
+        return msg.content, []
+    text_parts: list[str] = []
+    images: list[str] = []
+    for part in msg.content:
+        if isinstance(part, ResponsesInputTextContent):
+            text_parts.append(part.text)
+        elif isinstance(part, ResponsesInputImageContent):
+            images.append(part.image_url)
+    return "".join(text_parts), images
+
+
+def _new_response_id() -> str:
+    return f"resp_{uuid.uuid4().hex[:24]}"
+
+
+def _new_message_id() -> str:
+    return f"msg_{uuid.uuid4().hex[:24]}"
+
+
+def _build_completed_response(
+    *,
+    response_id: str,
+    model_name: str,
+    text: str,
+    policy: PolicyHint,
+    trace_id: str,
+    previous_response_id: str | None,
+) -> ResponsesResponse:
+    return ResponsesResponse(
+        id=response_id,
+        created_at=int(time.time()),
+        model=model_name,
+        status="completed",
+        output=[
+            ResponsesOutputMessage(
+                id=_new_message_id(),
+                content=[ResponsesOutputTextContent(text=text)],
+            )
+        ],
+        output_text=text,
+        usage=ResponsesUsage(),
+        trace_id=trace_id,
+        policy=policy,
+        previous_response_id=previous_response_id,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 流式：OpenAI Responses 事件协议
+# ---------------------------------------------------------------------------
+
+
+def _format_event(
+    event_type: str,
+    payload: dict[str, Any],
+    *,
+    sequence_number: int,
+) -> bytes:
+    body = json.dumps(
+        {**payload, "type": event_type, "sequence_number": sequence_number},
+        ensure_ascii=False,
+    )
+    return f"event: {event_type}\ndata: {body}\n\n".encode()
+
+
+def _new_event_formatter() -> Callable[[str, dict[str, Any]], bytes]:
+    sequence_number = 0
+
+    def format_event(event_type: str, payload: dict[str, Any]) -> bytes:
+        nonlocal sequence_number
+        event = _format_event(
+            event_type,
+            payload,
+            sequence_number=sequence_number,
+        )
+        sequence_number += 1
+        return event
+
+    return format_event
+
+
+async def _stream_silenced(
+    *,
+    response_id: str,
+    model_name: str,
+    trace_id: str,
+    sentinel: str,
+    policy: PolicyHint,
+    previous_response_id: str | None,
+) -> AsyncIterator[bytes]:
+    """决策层选择不回复时的 Responses 事件序列。"""
+    format_event = _new_event_formatter()
+    created_at = int(time.time())
+    message_id = _new_message_id()
+    base_response = {
+        "id": response_id,
+        "object": "response",
+        "created_at": created_at,
+        "model": model_name,
+        "status": "in_progress",
+        "output": [],
+        "trace_id": trace_id,
+        "policy": policy.model_dump(),
+        "previous_response_id": previous_response_id,
+    }
+    yield format_event("response.created", {"response": base_response})
+    yield format_event("response.in_progress", {"response": base_response})
+
+    item = {
+        "id": message_id,
+        "type": "message",
+        "role": "assistant",
+        "status": "in_progress",
+        "content": [],
+    }
+    yield format_event(
+        "response.output_item.added",
+        {"output_index": 0, "item": item},
+    )
+    content_part = {"type": "output_text", "text": "", "annotations": []}
+    yield format_event(
+        "response.content_part.added",
+        {
+            "item_id": message_id,
+            "output_index": 0,
+            "content_index": 0,
+            "part": content_part,
+        },
+    )
+    if sentinel:
+        yield format_event(
+            "response.output_text.delta",
+            {
+                "item_id": message_id,
+                "output_index": 0,
+                "content_index": 0,
+                "delta": sentinel,
+            },
+        )
+    yield format_event(
+        "response.output_text.done",
+        {
+            "item_id": message_id,
+            "output_index": 0,
+            "content_index": 0,
+            "text": sentinel,
+        },
+    )
+    final_part = {**content_part, "text": sentinel}
+    yield format_event(
+        "response.content_part.done",
+        {
+            "item_id": message_id,
+            "output_index": 0,
+            "content_index": 0,
+            "part": final_part,
+        },
+    )
+    final_item = {
+        **item,
+        "status": "completed",
+        "content": [final_part],
+    }
+    yield format_event(
+        "response.output_item.done",
+        {"output_index": 0, "item": final_item},
+    )
+    completed_response = {
+        **base_response,
+        "status": "completed",
+        "output": [final_item],
+        "output_text": sentinel,
+        "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+    }
+    yield format_event("response.completed", {"response": completed_response})
+    yield b"data: [DONE]\n\n"
+
+
+async def _stream_response(
+    *,
+    state: AppState,
+    response_id: str,
+    messages: list[dict[str, Any]],
+    params: GenerationParams,
+    model_name: str,
+    conversation_id: str | None,
+    user_text: str,
+    image_shas: list[str],
+    trace_id: str,
+    policy: PolicyHint,
+    previous_response_id: str | None,
+    decision: ResponseDecision,
+) -> AsyncIterator[bytes]:
+    """正常流式：把主模型 delta 翻译成 Responses 事件序列。"""
+    format_event = _new_event_formatter()
+    created_at = int(time.time())
+    message_id = _new_message_id()
+    buffer: list[str] = []
+    output_filter = AssistantOutputFilter(
+        valid_sticker_names=available_sticker_names(state.settings),
+    )
+
+    base_response = {
+        "id": response_id,
+        "object": "response",
+        "created_at": created_at,
+        "model": model_name,
+        "status": "in_progress",
+        "output": [],
+        "trace_id": trace_id,
+        "policy": policy.model_dump(),
+        "previous_response_id": previous_response_id,
+    }
+    yield format_event("response.created", {"response": base_response})
+    yield format_event("response.in_progress", {"response": base_response})
+
+    item = {
+        "id": message_id,
+        "type": "message",
+        "role": "assistant",
+        "status": "in_progress",
+        "content": [],
+    }
+    yield format_event(
+        "response.output_item.added",
+        {"output_index": 0, "item": item},
+    )
+    content_part = {"type": "output_text", "text": "", "annotations": []}
+    yield format_event(
+        "response.content_part.added",
+        {
+            "item_id": message_id,
+            "output_index": 0,
+            "content_index": 0,
+            "part": content_part,
+        },
+    )
+
+    _stream_start = time.perf_counter()
+    try:
+        async for piece in state.llm.stream_chat(
+            messages,
+            params,
+            model=model_name,
+            trace_id=trace_id,
+            stage="responses.stream",
+            metrics=state.metrics,
+        ):
+            filtered = output_filter.feed(piece)
+            if not filtered:
+                continue
+            buffer.append(filtered)
+            yield format_event(
+                "response.output_text.delta",
+                {
+                    "item_id": message_id,
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": filtered,
+                },
+            )
+        tail = output_filter.flush()
+        if tail:
+            buffer.append(tail)
+            yield format_event(
+                "response.output_text.delta",
+                {
+                    "item_id": message_id,
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": tail,
+                },
+            )
+        state.metrics.record(
+            "llm.stream",
+            (time.perf_counter() - _stream_start) * 1000,
+            detail=f"{model_name},chars={sum(len(p) for p in buffer)}",
+        )
+    except XuwenError as e:
+        state.metrics.record(
+            "llm.stream",
+            (time.perf_counter() - _stream_start) * 1000,
+            error=e.code,
+        )
+        yield format_event(
+            "response.failed",
+            {
+                "response": {
+                    **base_response,
+                    "status": "failed",
+                    "error": {
+                        "code": e.code,
+                        "message": e.message,
+                    },
+                }
+            },
+        )
+        yield b"data: [DONE]\n\n"
+        return
+
+    assistant_text = "".join(buffer)
+    yield format_event(
+        "response.output_text.done",
+        {
+            "item_id": message_id,
+            "output_index": 0,
+            "content_index": 0,
+            "text": assistant_text,
+        },
+    )
+    final_part = {**content_part, "text": assistant_text}
+    yield format_event(
+        "response.content_part.done",
+        {
+            "item_id": message_id,
+            "output_index": 0,
+            "content_index": 0,
+            "part": final_part,
+        },
+    )
+    final_item = {
+        **item,
+        "status": "completed",
+        "content": [final_part],
+    }
+    yield format_event(
+        "response.output_item.done",
+        {"output_index": 0, "item": final_item},
+    )
+    completed_response = {
+        **base_response,
+        "status": "completed",
+        "output": [final_item],
+        "output_text": assistant_text,
+        "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+    }
+    yield format_event("response.completed", {"response": completed_response})
+    yield b"data: [DONE]\n\n"
+
+    ai_silenced = is_ai_silence_signal(
+        assistant_text,
+        sentinel=effective_silence_sentinel(state.settings),
+        decision=decision,
+    )
+    # 流结束后把最终采用的生活事件异步交给 Life 模型。
+    raw_full = output_filter.raw_text()
+    life_extraction = extract_life_events(raw_full)
+    schedule_life_events(
+        life_extraction.events if not ai_silenced else (),
+        state.life,
+        enabled=state.settings.life_marker_update_enabled,
+        llm=state.life_llm,
+        model=state.settings.resolved_life_model,
+        apply_lock=state.life_apply_lock,
+        pending_tasks=state.pending_life_tasks,
+        assistant_text=assistant_text,
+        current_user_text=user_text,
+        trace_id=trace_id,
+        metrics=state.metrics,
+    )
+
+    # AI 自主沉默：累积完整 buffer == sentinel → 写历史时置空，避免污染检索；
+    # 流式事件已经发完，前端收到的内容仍是 sentinel，由 sentinel 自身表达沉默语义。
+    if ai_silenced:
+        state.metrics.record(
+            "responses.silenced.ai",
+            0.0,
+            detail=f"trace={trace_id},{decision.metric_detail()},stream",
+        )
+    persisted_text = "" if ai_silenced else assistant_text
+
+    if conversation_id and (persisted_text or ai_silenced):
+        await state.writeback.enqueue_turn(
+            WritebackTurn(
+                conversation_id=conversation_id,
+                user_text=user_text,
+                assistant_text=persisted_text,
+                user_image_shas=image_shas,
+            )
+        )
+        await _remember_relationship_turn(
+            state,
+            conversation_id=conversation_id,
+            decision=decision,
+            trace_id=trace_id,
+        )
+    await state.proactive_context_cache.append_turn(
+        caller_id=None,
+        conversation_id=conversation_id,
+        user_text=user_text,
+        assistant_text=persisted_text,
+    )
+
+    state.responses_store.put(
+        ResponseRecord(
+            response_id=response_id,
+            conversation_id=conversation_id,
+            user_text=user_text,
+            assistant_text=persisted_text,
+            created_at=created_at,
+            model=model_name,
+        )
+    )
+
+
+async def _remember_relationship_turn(
+    state: AppState,
+    *,
+    conversation_id: str,
+    decision: ResponseDecision,
+    trace_id: str,
+) -> None:
+    try:
+        await state.relationship_memory.remember_turn(
+            conversation_id=conversation_id,
+            entry=decision.relationship_memory,
+        )
+    except Exception:
+        logger.warning("Responses 关系记忆写入失败，已忽略：trace=%s", trace_id, exc_info=True)
+        state.metrics.record("responses.relationship.remember", 0.0, error="Exception")

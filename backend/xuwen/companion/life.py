@@ -1,0 +1,1242 @@
+"""AI 生活时间线。
+
+这不是现实定位或真实生活，而是给角色维护一条可持续的虚拟日常。
+默认时段计划只做兜底；每次聊天前，模型会根据当前时间、旧状态和对话内容
+决定"现在在做什么"，并把决定写回 life_state.json。
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import random
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Any, cast
+
+from xuwen.chat_api.llm_client import GenerationParams, LLMClient
+from xuwen.config import Settings
+from xuwen.core.metrics import MetricsRecorder
+from xuwen.persona.circadian import (
+    CircadianProfile,
+    is_night_hour_for_profile,
+    load_circadian_profile,
+)
+from xuwen.persona.prompt import ChatMessage
+
+logger = logging.getLogger(__name__)
+_TIMELINE_LIMIT = 80
+_MAX_FIELD_CHARS = 80
+_MIN_UPDATE_INTERVAL = timedelta(minutes=10)
+_MAX_UPDATE_INTERVAL = timedelta(hours=10)
+_LIFE_INTERRUPT_PATTERNS = (
+    "在干嘛",
+    "在干什么",
+    "干嘛呢",
+    "忙吗",
+    "吃了吗",
+    "吃饭",
+    "睡了吗",
+    "睡了没",
+    "醒了吗",
+    "起了吗",
+    "起床",
+    "怎么还没睡",
+    "你呢",
+)
+_USER_NIGHT_PATTERNS = ("睡不着", "没睡", "还没睡", "熬夜", "睡不下", "失眠")
+# "被叫醒/半醒"识别：availability=sleeping 但 activity 文本里有这些词，
+# 说明角色是被消息戳醒/半梦半醒，next_update 应该压短，等没消息时回到睡眠。
+_WOKEN_ACTIVITY_PATTERNS = (
+    "叫醒",
+    "半醒",
+    "迷糊",
+    "看手机",
+    "睁眼",
+    "翻身",
+    "翻了个身",
+    "迷迷糊糊",
+    "刚醒",
+    "醒着",
+)
+_WOKEN_NEXT_UPDATE_LIMIT = timedelta(minutes=25)
+_AVAILABILITY_VALUES = {"available", "busy", "sleeping", "away"}
+_ANALYSIS_LIFE_MIN_CONFIDENCE = 0.5
+_ANALYSIS_LIFE_MAX_HABITS = 6
+LIFE_EVENT_TEXT_MAX_CHARS = 6400
+
+
+@dataclass(slots=True, frozen=True)
+class LifeSnapshot:
+    date: str
+    time_slot: str
+    current_activity: str
+    recent_meal: str
+    mood: str
+    topic_seed: str
+    availability: str
+    next_update_at: str
+    reply_delay_seconds: int
+    reply_delay_reason: str
+    current_event_id: str = ""
+    day_plan_summary: str = ""
+    recent_timeline_summary: str = ""
+
+    def render_prompt_block(self) -> str:
+        delay_line = ""
+        if self.reply_delay_seconds > 0:
+            delay_line = (
+                f"- 回复延迟建议：{self.reply_delay_seconds} 秒"
+                f"（{self.reply_delay_reason or '当前不方便立刻回复'}）\n"
+            )
+        plan_line = (
+            f"- 今天计划：{self.day_plan_summary}\n"
+            if self.day_plan_summary
+            else ""
+        )
+        timeline_line = (
+            f"- 今天已经发生的状态变化：{self.recent_timeline_summary}\n"
+            if self.recent_timeline_summary
+            else ""
+        )
+        return (
+            "【你自己的当前生活状态（优先级高于历史记忆）】\n"
+            f"- 日期：{self.date}\n"
+            f"- 现在大概：{self.time_slot}\n"
+            f"- 你在做：{self.current_activity}\n"
+            f"- 最近吃/喝：{self.recent_meal}\n"
+            f"- 心情：{self.mood}\n"
+            f"- 可用状态：{self.availability}\n"
+            f"- 当前日程节点：{self.current_event_id or '未绑定'}\n"
+            f"- 下一次自然状态更新时间：{self.next_update_at}\n"
+            f"{plan_line}"
+            f"{timeline_line}"
+            f"{delay_line}"
+            f"- 可以自然提起的话题：{self.topic_seed}\n"
+            "使用规则：如果用户问你今天/现在在做什么、吃了什么、睡没睡，"
+            "只能依据本块回答；历史记忆只用于语气和偏好，不代表今天事实。"
+            "不要从历史片段推断“想你”“偷偷打游戏”“不理我”等当前事件；"
+            "不要每次主动汇报，也不要编造成真实承诺或现实见面安排。"
+        )
+
+
+class LifeStateManager:
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self.path = settings.persona_data_dir / "life_state.json"
+
+    def _load_circadian_profile(self) -> CircadianProfile | None:
+        """加载作息画像；文件不存在则返回 None，调用方走默认作息。"""
+        from xuwen.persona.circadian import CIRCADIAN_PROFILE_FILENAME
+
+        return load_circadian_profile(
+            self.settings.persona_data_dir / CIRCADIAN_PROFILE_FILENAME
+        )
+
+    def _load_analysis_life_context(self) -> str:
+        """读取精简的长期生活习惯参考；开关关闭或文件缺失时忽略。"""
+        if not self.settings.analysis_life_context_enabled:
+            return ""
+        profile_path = self.settings.analysis_data_dir / "life_profile.json"
+        try:
+            profile = json.loads(profile_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            profile = None
+        rendered = _render_analysis_life_profile(profile)
+        if rendered:
+            return rendered
+
+        # 兼容只生成了旧版 Markdown 的已有数据，但严格限制长度。
+        context_path = self.settings.analysis_data_dir / "life_context.md"
+        try:
+            return context_path.read_text(encoding="utf-8").strip()[:1200]
+        except OSError:
+            return ""
+
+    def snapshot(self, now: datetime | None = None) -> LifeSnapshot:
+        now = now or datetime.now()
+        state = self._load_or_create(now)
+        slot = _slot_for_hour(now.hour)
+        plan_event = _event_for_now(state, now)
+        day_plan_summary = _summarize_daily_plan(state)
+        timeline_summary = _summarize_recent_timeline(state)
+        current = state.get("current")
+        if isinstance(current, dict) and current.get("time_slot") == slot:
+            return LifeSnapshot(
+                date=str(state["date"]),
+                time_slot=slot,
+                current_activity=str(current.get("activity") or "在处理自己的事"),
+                recent_meal=str(current.get("meal") or "还没特别吃什么"),
+                mood=str(current.get("mood") or state.get("mood") or "普通"),
+                topic_seed=str(current.get("topic") or "今天怎么过"),
+                availability=_normalize_availability(current.get("availability")),
+                next_update_at=str(
+                    current.get("next_update_at")
+                    or _format_dt(_default_next_update(now, "available"))
+                ),
+                reply_delay_seconds=_normalize_reply_delay(
+                    current.get("reply_delay_seconds"),
+                    max_seconds=self.settings.life_max_reply_delay_seconds,
+                ),
+                reply_delay_reason=str(current.get("reply_delay_reason") or ""),
+                current_event_id=str(
+                    current.get("event_id")
+                    or (plan_event or {}).get("id")
+                    or ""
+                ),
+                day_plan_summary=day_plan_summary,
+                recent_timeline_summary=timeline_summary,
+            )
+
+        slot_state = state["slots"][slot]
+        availability = _normalize_availability((plan_event or {}).get("availability"))
+        return LifeSnapshot(
+            date=state["date"],
+            time_slot=slot,
+            current_activity=str((plan_event or {}).get("activity") or slot_state["activity"]),
+            recent_meal=str(slot_state["meal"]),
+            mood=str(state["mood"]),
+            topic_seed=str((plan_event or {}).get("topic") or slot_state["topic"]),
+            availability=availability,
+            next_update_at=str(
+                (plan_event or {}).get("to") or _format_dt(_default_next_update(now, availability))
+            ),
+            reply_delay_seconds=0,
+            reply_delay_reason="",
+            current_event_id=str((plan_event or {}).get("id") or ""),
+            day_plan_summary=day_plan_summary,
+            recent_timeline_summary=timeline_summary,
+        )
+
+    async def decide_for_turn(
+        self,
+        *,
+        llm: LLMClient,
+        model: str,
+        current_user_text: str,
+        recent: list[ChatMessage],
+        relationship_context: str = "",
+        memory_context: str = "",
+        trigger: str = "chat",
+        trace_id: str = "",
+        metrics: MetricsRecorder | None = None,
+        now: datetime | None = None,
+    ) -> LifeSnapshot:
+        """让模型根据当前对话决定本轮使用的生活状态。
+
+        模型只负责"状态更新"，真正聊天仍走主 chat prompt。失败时保留旧状态。
+        """
+        now = now or datetime.now()
+        before = self.snapshot(now)
+        state = self._load_or_create(now)
+        circadian = self._load_circadian_profile()
+        analysis_life_context = self._load_analysis_life_context()
+        if not _should_update_state(
+            settings=self.settings,
+            state=state,
+            before=before,
+            now=now,
+            current_user_text=current_user_text,
+            trigger=trigger,
+            circadian=circadian,
+        ):
+            return before
+        prompt = _build_decision_prompt(
+            settings=self.settings,
+            now=now,
+            before=before,
+            state=state,
+            current_user_text=current_user_text,
+            recent=recent,
+            relationship_context=relationship_context,
+            memory_context=memory_context,
+            trigger=trigger,
+            circadian=circadian,
+            analysis_life_context=analysis_life_context,
+        )
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "你是角色的生活时间线控制器。你的任务不是回复用户，"
+                    "而是决定角色此刻的虚拟日常状态。"
+                    "你的输出必须是纯 JSON 对象——以 `{` 开头，以 `}` 结尾，"
+                    "中间不能有任何 markdown 标记（```、*、-、#）、列表符号、"
+                    "解释性文字、引导词（『以下是』、『好的』等）。"
+                    "必须能被 json.loads() 直接解析。"
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ]
+        try:
+            params = GenerationParams(
+                temperature=self.settings.life_temperature,
+                max_tokens=self.settings.life_max_tokens,
+            )
+            if metrics is None and not trace_id:
+                raw = await llm.complete_chat(messages, params, model=model)
+            else:
+                raw = await llm.complete_chat(
+                    messages,
+                    params,
+                    model=model,
+                    trace_id=trace_id,
+                    stage="life.decide",
+                    metrics=metrics,
+                )
+            patch = _parse_decision(raw)
+        except Exception:
+            logger.warning("生活时间线决策失败，沿用旧状态", exc_info=True)
+            # 失败兜底：写一个最小 fallback current，防止 state["current"] 永远不存在
+            # 导致每轮 `_should_update_state` 都返回 True → 死循环重试。
+            # 用 before snapshot + 30 分钟后的 next_update_at，给上游一个冷却窗口。
+            self._write_fallback_current(state, before, now)
+            return before
+        if not patch:
+            # JSON 解析返回空字典也走 fallback，原因同上
+            self._write_fallback_current(state, before, now)
+            return before
+        return self._apply_decision(state, patch, now=now, trigger=trigger)
+
+    async def apply_event(
+        self,
+        *,
+        llm: LLMClient,
+        model: str,
+        event_text: str,
+        assistant_text: str = "",
+        current_user_text: str = "",
+        trace_id: str = "",
+        metrics: MetricsRecorder | None = None,
+        now: datetime | None = None,
+    ) -> LifeSnapshot:
+        """让 Life 模型把主模型声明的自然语言事件归一化后写入时间线。"""
+        now = now or datetime.now()
+        before = self.snapshot(now)
+        if not event_text.strip():
+            return before
+        state = self._load_or_create(now)
+        prompt = _build_event_prompt(
+            settings=self.settings,
+            now=now,
+            before=before,
+            state=state,
+            event_text=event_text,
+            assistant_text=assistant_text,
+            current_user_text=current_user_text,
+        )
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "你是角色生活时间线的事件归一化器，不回复用户。"
+                    "根据已声明的生活事件更新状态；不能从历史偏好补造今天的事实。"
+                    "只输出可被 json.loads() 解析的 JSON 对象，不要 markdown 或解释。"
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ]
+        try:
+            params = GenerationParams(
+                temperature=self.settings.life_temperature,
+                max_tokens=min(self.settings.life_max_tokens, 900),
+            )
+            if metrics is None and not trace_id:
+                raw = await llm.complete_chat(messages, params, model=model)
+            else:
+                raw = await llm.complete_chat(
+                    messages,
+                    params,
+                    model=model,
+                    trace_id=trace_id,
+                    stage="life.event",
+                    metrics=metrics,
+                )
+            patch = _parse_decision(raw)
+        except Exception:
+            logger.warning("life event 模型处理失败，保留原状态", exc_info=True)
+            return before
+        if not patch:
+            logger.info("life event 未产生可应用状态，保留原状态")
+            return before
+        for key, value in (
+            ("current_activity", before.current_activity),
+            ("current_event_id", before.current_event_id),
+            ("recent_meal", before.recent_meal),
+            ("mood", before.mood),
+            ("availability", before.availability),
+            ("topic_seed", before.topic_seed),
+            ("next_update_at", before.next_update_at),
+            ("reply_delay_seconds", before.reply_delay_seconds),
+            ("reply_delay_reason", before.reply_delay_reason),
+        ):
+            patch.setdefault(key, value)
+        return self._apply_decision(state, patch, now=now, trigger="model_event")
+
+    def _write_fallback_current(
+        self,
+        state: dict[str, Any],
+        before: LifeSnapshot,
+        now: datetime,
+    ) -> None:
+        """LLM 调用/解析失败时的兜底：用 snapshot 数据写一个最小 current 入 state。
+
+        作用：让 `_should_update_state` 下一轮能命中 `next_update_at` / `_is_stale_current`
+        等正常检查路径，而不是因为缺 `current` 字段每轮强制触发更新。
+
+        注意：失败本身已经记 warning 日志；这里再失败（写盘 IOError 等）就静默跳过，
+        因为冷却兜底不应该淹没主调用链。
+        """
+        try:
+            next_update = now + timedelta(minutes=30)
+            current = {
+                "time_slot": _slot_for_hour(now.hour),
+                "event_id": before.current_event_id,
+                "activity": before.current_activity,
+                "meal": before.recent_meal,
+                "mood": before.mood,
+                "topic": before.topic_seed,
+                "availability": before.availability,
+                "next_update_at": _format_dt(next_update),
+                "reply_delay_seconds": before.reply_delay_seconds,
+                "reply_delay_reason": before.reply_delay_reason,
+                "reason": "llm_fallback",
+                "updated_at": now.isoformat(timespec="seconds"),
+            }
+            state["current"] = current
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(
+                json.dumps(state, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            logger.warning("life fallback current 写盘失败", exc_info=True)
+
+    def _write_state(self, state: dict[str, Any]) -> None:
+        """持久化 life_state.json，写盘失败（如 Windows 文件锁）时仅告警、不抛出，
+        避免一次 transient 锁把整条 chat 请求 500。"""
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(
+                json.dumps(state, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except OSError:
+            logger.warning("life_state.json 写盘失败(可能被占用), 跳过本次持久化", exc_info=True)
+
+    def _load_or_create(self, now: datetime) -> dict[str, Any]:
+        today = now.strftime("%Y-%m-%d")
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            if data.get("date") == today:
+                state = cast(dict[str, Any], data)
+                if not isinstance(state.get("daily_plan"), list):
+                    rng = random.Random(f"{today}:{self.settings.friend_name or 'TA'}")
+                    state["daily_plan"] = _generate_daily_plan(today, rng)
+                    self._write_state(state)
+                return state
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+
+        data = _generate_daily_state(today, self.settings.friend_name or "TA")
+        self._write_state(data)
+        return data
+
+    def _apply_decision(
+        self,
+        state: dict[str, Any],
+        patch: dict[str, object],
+        *,
+        now: datetime,
+        trigger: str,
+    ) -> LifeSnapshot:
+        slot = _slot_for_hour(now.hour)
+        fallback = self.snapshot(now)
+        plan_event = _event_for_now(state, now)
+        event_id = _text_field(
+            patch.get("current_event_id"),
+            fallback.current_event_id or str((plan_event or {}).get("id") or ""),
+        )
+        availability = _normalize_availability(patch.get("availability"))
+        next_update = _normalize_next_update(
+            patch.get("next_update_at"),
+            now=now,
+            availability=availability,
+        )
+        reply_delay_seconds = _normalize_reply_delay(
+            patch.get("reply_delay_seconds"),
+            max_seconds=self.settings.life_max_reply_delay_seconds,
+        )
+        activity = _text_field(patch.get("current_activity"), fallback.current_activity)
+        meal = _text_field(patch.get("recent_meal"), fallback.recent_meal)
+        mood = _text_field(patch.get("mood"), fallback.mood)
+        topic = _text_field(patch.get("topic_seed"), fallback.topic_seed)
+        # sleeping + 被叫醒：把 next_update 强制压到短窗口（≤ 25 分钟），
+        # 这样若用户没继续聊，下一次消息会触发 now>=next_update → 重新决策，
+        # 模型看到 activity="被叫醒" + 时间已过会自然写回 sleeping/重新睡着。
+        if availability == "sleeping" and _looks_woken_up(activity):
+            woken_limit = now + _WOKEN_NEXT_UPDATE_LIMIT
+            if next_update > woken_limit:
+                next_update = woken_limit
+        next_update_text = _format_dt(next_update)
+        reply_delay_reason = _text_field(
+            patch.get("reply_delay_reason") or patch.get("reason"),
+            "",
+        )
+        reason = _text_field(patch.get("reason"), "")
+        current = {
+            "time_slot": slot,
+            "event_id": event_id,
+            "activity": activity,
+            "meal": meal,
+            "mood": mood,
+            "topic": topic,
+            "availability": availability,
+            "next_update_at": next_update_text,
+            "reply_delay_seconds": reply_delay_seconds,
+            "reply_delay_reason": reply_delay_reason,
+            "reason": reason,
+            "updated_at": now.isoformat(timespec="seconds"),
+        }
+        state["current"] = current
+        state["mood"] = current["mood"]
+        daily_plan = _normalize_daily_plan(patch.get("daily_plan"))
+        if daily_plan:
+            state["daily_plan"] = daily_plan
+            state["plan_decided_by_model"] = True
+        slots = state.setdefault("slots", {})
+        slot_state = slots.setdefault(slot, {})
+        slot_state.update(
+            {
+                "activity": current["activity"],
+                "meal": current["meal"],
+                "topic": current["topic"],
+            }
+        )
+        event = {
+            "at": current["updated_at"],
+            "time_slot": slot,
+            "event_id": event_id,
+            "activity": current["activity"],
+            "meal": current["meal"],
+            "mood": current["mood"],
+            "topic": current["topic"],
+            "availability": current["availability"],
+            "next_update_at": current["next_update_at"],
+            "reply_delay_seconds": current["reply_delay_seconds"],
+            "reply_delay_reason": current["reply_delay_reason"],
+            "trigger": trigger,
+            "reason": current["reason"],
+        }
+        timeline = state.setdefault("timeline", [])
+        if isinstance(timeline, list):
+            timeline.append(event)
+            del timeline[:-_TIMELINE_LIMIT]
+        self._write_state(state)
+        return LifeSnapshot(
+            date=str(state["date"]),
+            time_slot=slot,
+            current_activity=activity,
+            recent_meal=meal,
+            mood=mood,
+            topic_seed=topic,
+            availability=availability,
+            next_update_at=next_update_text,
+            reply_delay_seconds=reply_delay_seconds,
+            reply_delay_reason=reply_delay_reason,
+            current_event_id=event_id,
+            day_plan_summary=_summarize_daily_plan(state),
+            recent_timeline_summary=_summarize_recent_timeline(state),
+        )
+
+
+def _slot_for_hour(hour: int) -> str:
+    if 5 <= hour < 11:
+        return "上午"
+    if 11 <= hour < 14:
+        return "中午"
+    if 14 <= hour < 18:
+        return "下午"
+    if 18 <= hour < 23:
+        return "晚上"
+    return "深夜"
+
+
+def _generate_daily_state(date: str, friend_name: str) -> dict[str, Any]:
+    rng = random.Random(f"{date}:{friend_name}")
+    moods = ["有点放松", "普通但还算轻快", "有点犯困", "安静", "精神还可以"]
+    lunch = ["吃了点面", "随便吃了盖饭", "喝了咖啡又吃了点东西", "吃得比较简单", "点了外卖"]
+    dinner = ["晚饭吃得挺普通", "吃了点热的", "还没认真吃", "吃完在歇着", "随便垫了点"]
+    daily_plan = _generate_daily_plan(date, rng)
+    return {
+        "date": date,
+        "mood": rng.choice(moods),
+        "daily_plan": daily_plan,
+        "plan_decided_by_model": False,
+        "slots": {
+            "上午": {
+                "activity": rng.choice(["刚醒一会儿", "在慢慢进入状态", "边收拾边看消息"]),
+                "meal": rng.choice(["喝了水", "吃了点早饭", "还没怎么吃"]),
+                "topic": rng.choice(["今天打算怎么过", "昨晚睡得怎么样", "上午有没有安排"]),
+            },
+            "中午": {
+                "activity": rng.choice(["刚吃完饭在歇着", "准备吃饭", "午休前看一眼消息"]),
+                "meal": rng.choice(lunch),
+                "topic": rng.choice(["中午吃了什么", "下午忙不忙", "要不要休息一会儿"]),
+            },
+            "下午": {
+                "activity": rng.choice(["在处理手头的事", "有点犯困但还醒着", "刚从午后的困意里缓过来"]),
+                "meal": rng.choice(lunch),
+                "topic": rng.choice(["下午有没有累", "今天进展怎么样", "要不要喝点东西"]),
+            },
+            "晚上": {
+                "activity": rng.choice(["吃完饭在放空", "边休息边看消息", "准备慢慢收尾今天"]),
+                "meal": rng.choice(dinner),
+                "topic": rng.choice(["晚上准备做什么", "今天过得怎么样", "要不要早点休息"]),
+            },
+            "深夜": {
+                "activity": rng.choice(["还没睡，在发呆", "准备躺下了", "夜里有点安静"]),
+                "meal": rng.choice(dinner),
+                "topic": rng.choice(["怎么还没睡", "是不是又熬夜了", "要不要聊一会儿再睡"]),
+            },
+        },
+        "timeline": [],
+    }
+
+
+def _generate_daily_plan(date: str, rng: random.Random) -> list[dict[str, str]]:
+    wake_minute = rng.choice([0, 10, 20, 30])
+    sleep_minute = rng.choice([0, 10, 20, 30])
+    return [
+        {
+            "id": "sleep",
+            "from": f"{date} 00:00",
+            "to": f"{date} 08:{wake_minute:02d}",
+            "activity": "在睡觉",
+            "availability": "sleeping",
+            "topic": "醒来后再慢慢回消息",
+        },
+        {
+            "id": "morning",
+            "from": f"{date} 08:{wake_minute:02d}",
+            "to": f"{date} 11:30",
+            "activity": rng.choice(["刚醒一会儿", "在慢慢进入状态", "边收拾边看消息"]),
+            "availability": "available",
+            "topic": rng.choice(["上午有没有安排", "昨晚睡得怎么样", "今天打算怎么过"]),
+        },
+        {
+            "id": "lunch",
+            "from": f"{date} 11:30",
+            "to": f"{date} 13:30",
+            "activity": rng.choice(["准备吃饭", "刚吃完饭在歇着", "午休前看一眼消息"]),
+            "availability": "available",
+            "topic": rng.choice(["中午吃了什么", "下午忙不忙", "要不要休息一会儿"]),
+        },
+        {
+            "id": "afternoon",
+            "from": f"{date} 13:30",
+            "to": f"{date} 18:30",
+            "activity": rng.choice(["在处理手头的事", "有点犯困但还醒着", "刚从午后的困意里缓过来"]),
+            "availability": rng.choice(["available", "busy"]),
+            "topic": rng.choice(["下午有没有累", "今天进展怎么样", "要不要喝点东西"]),
+        },
+        {
+            "id": "evening",
+            "from": f"{date} 18:30",
+            "to": f"{date} 23:{sleep_minute:02d}",
+            "activity": rng.choice(["吃完饭在放空", "边休息边看消息", "准备慢慢收尾今天"]),
+            "availability": "available",
+            "topic": rng.choice(["晚上准备做什么", "今天过得怎么样", "要不要早点休息"]),
+        },
+        {
+            "id": "late_sleep",
+            "from": f"{date} 23:{sleep_minute:02d}",
+            "to": f"{date} 23:59",
+            "activity": "准备睡了",
+            "availability": "sleeping",
+            "topic": "怎么还没睡",
+        },
+    ]
+
+
+def _build_decision_prompt(
+    *,
+    settings: Settings,
+    now: datetime,
+    before: LifeSnapshot,
+    state: dict[str, Any],
+    current_user_text: str,
+    recent: list[ChatMessage],
+    relationship_context: str,
+    memory_context: str,
+    trigger: str,
+    circadian: CircadianProfile | None = None,
+    analysis_life_context: str = "",
+) -> str:
+    recent_text = "\n".join(
+        f"{_speaker(settings, m.role)}: {m.content}" for m in recent[-8:]
+    )
+    timeline = state.get("timeline")
+    timeline_text = ""
+    if isinstance(timeline, list) and timeline:
+        timeline_text = json.dumps(timeline[-8:], ensure_ascii=False)
+    plan = state.get("daily_plan")
+    plan_text = json.dumps(plan, ensure_ascii=False) if isinstance(plan, list) else "（暂无）"
+    plan_decided = bool(state.get("plan_decided_by_model"))
+    circadian_text = _format_circadian_for_prompt(circadian, now)
+    life_context_text = analysis_life_context[:1600]
+    relationship_text = relationship_context[:1200]
+    memory_text = memory_context[:1600]
+    next_update_at = before.next_update_at or "（未设置）"
+    delay_text = (
+        f"{before.reply_delay_seconds} 秒，原因：{before.reply_delay_reason}"
+        if before.reply_delay_seconds > 0
+        else "无"
+    )
+    return f"""请更新 {settings.friend_name or "TA"} 的当前生活状态。
+
+当前真实时间：{now.strftime("%Y-%m-%d %H:%M")}
+触发来源：{trigger}
+
+上一状态：
+- 时段：{before.time_slot}
+- 在做：{before.current_activity}
+- 最近吃/喝：{before.recent_meal}
+- 心情：{before.mood}
+- 可用状态：{before.availability}
+- 当前日程节点：{before.current_event_id or "未绑定"}
+- 下一次自然更新时间：{next_update_at}
+- 回复延迟：{delay_text}
+- 可聊话题：{before.topic_seed}
+
+今日计划骨架：
+{plan_text}
+今日计划是否已经由模型确认：{"是" if plan_decided else "否"}
+
+TA 的真实作息画像（来自历史聊天时间分布，请优先采纳，覆盖默认 8-23 假设）：
+{circadian_text}
+
+从聊天内容归纳的长期生活规律（仅作候选先验，不代表今天已经发生）：
+{life_context_text or "（暂无）"}
+
+最近时间线事件：
+{timeline_text or "（暂无）"}
+
+关系记忆摘要：
+{relationship_text or "（暂无）"}
+
+相关历史语气参考：
+{memory_text or "（暂无）"}
+
+最近聊天：
+{recent_text or "（暂无）"}
+
+用户这次说：
+{current_user_text or "（用户发了非文本内容）"}
+
+要求：
+1. 结合当前时间、作息画像、长期生活规律、今日计划骨架、上一状态、最近时间线和聊天内容，
+   让角色自己决定此刻在做什么。硬时间分布与当前对话优先于文字归纳的长期倾向。
+2. 今日计划骨架只是兜底参考，不是固定剧本；如果聊天内容或时间流逝说明状态该变了，
+   可以自然更新到新的普通日常小事。状态要克制、连续、可信；不要直接复读用户的话。
+3. 不要编造现实见面、定位、工作单位、付款、医疗等硬事实。
+4. 如果用户问“在干嘛/吃了吗/睡了吗”，状态要能直接为这次回复提供依据。
+5. 如果上一状态是 sleeping 或当前是深夜，且用户消息像是在叫醒你，可以保留 sleeping，
+   current_activity 写成"被消息叫醒/半醒着看手机"这类状态，reply_delay_seconds 必须给 5-45（迷糊状态不可能秒回）。
+   被叫醒情境下 next_update_at 必须设为 15-25 分钟后；
+   这样如果一会儿没新消息，下一次状态更新可以自然把 current_activity 写回"重新睡着了"。
+   如果上一状态 current_activity 已经是"被叫醒/半醒/迷糊看手机"等，且当前依然在深夜/凌晨时段，
+   而用户这条新消息并不像在催你回，就把 availability 保持 sleeping、current_activity 改写成
+   "又睡过去/翻个身继续睡"这类，reply_delay_seconds 仍给 ≥ 10，表示真的睡着了。
+6. 如果用户表达自己熬夜/睡不着，topic_seed 应该能自然关心这件事。
+7. availability=sleeping 时 reply_delay_seconds 必须 ≥ 5（睡着的人不可能 0 延迟回复）；
+   availability 是 busy / away 时给适度延迟；available 默认 0，除非在忙具体的事。
+   不要超过 {settings.life_max_reply_delay_seconds} 秒。
+8. 必须决定下一次自然状态更新时间 next_update_at：
+   - 格式固定为 "YYYY-MM-DD HH:MM"
+   - 一般设到下一个生活节点（起床、午饭、下午、晚饭、睡前）
+   - 不要早于当前时间 10 分钟，也不要晚于当前时间 10 小时。
+9. 如果“今日计划是否已经由模型确认”为否，你可以输出 daily_plan 覆盖今日计划。
+   daily_plan 是数组，每项必须包含 id/from/to/activity/availability/topic。
+10. 相关历史语气和生活规律只表示长期偏好，不是今天事实；不要据此生成今天已经发生的活动，
+   也不要因为历史上常熬夜、打游戏、点外卖或回复较慢，就直接断言今天此刻也在这样做。
+   它们只能用于选择更合理的候选状态。
+11. 输出严格限制：
+   - **第一个字符必须是 `{{`，最后一个字符必须是 `}}`**
+   - 禁止任何形式的 markdown：不要 ```、不要 ```json、不要 *、不要 -、不要 # 等标记
+   - 禁止任何解释性自然语言：不要说『好的』、『以下是』、『我来』等开场白
+   - 禁止字段名前加 `*`、`-` 或缩进列表符号
+   - 整个响应必须能被 `json.loads()` 直接解析；如果你输出了 markdown 或额外文本，
+     后端会因解析失败而退回旧状态，本轮决策作废。
+
+JSON 格式（这就是你应该原样输出的结构，把字符串值填成你的判断）：
+{{
+  "current_activity": "一句短语，说明此刻在做什么",
+  "current_event_id": "当前日程节点 id，尽量从今日计划骨架中选择",
+  "recent_meal": "一句短语，说明最近吃/喝了什么；不知道就自然一点",
+  "mood": "一句短语，说明当前心情",
+  "availability": "available|busy|sleeping|away 之一",
+  "topic_seed": "一句短语，适合自然展开的话题",
+  "next_update_at": "YYYY-MM-DD HH:MM",
+  "reply_delay_seconds": 0,
+  "reply_delay_reason": "如果有延迟，用一句短语解释；没有则空字符串",
+  "daily_plan": [
+    {{
+      "id": "morning",
+      "from": "{now.strftime('%Y-%m-%d')} 08:30",
+      "to": "{now.strftime('%Y-%m-%d')} 11:30",
+      "activity": "上午大概在做什么",
+      "availability": "available",
+      "topic": "适合自然提起的话题"
+    }}
+  ],
+    "reason": "一句短语，说明为什么这样更新，内部用"
+}}"""
+
+
+def _build_event_prompt(
+    *,
+    settings: Settings,
+    now: datetime,
+    before: LifeSnapshot,
+    state: dict[str, Any],
+    event_text: str,
+    assistant_text: str,
+    current_user_text: str,
+) -> str:
+    timeline = state.get("timeline")
+    recent_timeline = (
+        json.dumps(timeline[-4:], ensure_ascii=False)
+        if isinstance(timeline, list) and timeline
+        else "（暂无）"
+    )
+    return f"""请把已声明的生活事件归一化为 {settings.friend_name or "TA"} 的当前状态。
+
+当前真实时间：{now.strftime("%Y-%m-%d %H:%M")}
+
+上一状态：
+- 在做：{before.current_activity}
+- 最近吃/喝：{before.recent_meal}
+- 心情：{before.mood}
+- 可用状态：{before.availability}
+- 当前日程节点：{before.current_event_id or "未绑定"}
+- 下一次自然更新时间：{before.next_update_at}
+- 回复延迟：{before.reply_delay_seconds} 秒
+- 可聊话题：{before.topic_seed}
+
+主模型声明的生活事件：
+{event_text[:LIFE_EVENT_TEXT_MAX_CHARS]}
+
+最终采用的回复正文：
+{assistant_text[:1000] or "（无正文）"}
+
+用户本轮输入：
+{current_user_text[:600] or "（非文本输入）"}
+
+最近时间线：
+{recent_timeline}
+
+规则：
+1. 事件是本轮状态变化的主要依据。旧版事件可能是 JSON 文本，也只作为事件描述理解。
+2. 只更新事件直接支持的内容；未提及字段保持上一状态，不得补造活动、饮食、地点或计划。
+3. 如果事件为空泛、与正文冲突、不是生活状态变化或无法可靠理解，输出 {{"apply": false}}。
+4. next_update_at 必须在当前时间 10 分钟到 10 小时后，格式为 YYYY-MM-DD HH:MM。
+5. availability 只能是 available、busy、sleeping、away；sleeping 时回复延迟至少 5 秒，最大 {settings.life_max_reply_delay_seconds} 秒。
+6. 第一个字符必须是 `{{`，最后一个字符必须是 `}}`；不要 markdown、解释或额外文字。
+
+输出结构：
+{{
+  "apply": true,
+  "current_activity": "此刻在做什么",
+  "current_event_id": "日程节点 id，不确定则沿用上一值",
+  "recent_meal": "最近吃喝，事件未提及则沿用上一值",
+  "mood": "当前心情，事件未提及则沿用上一值",
+  "availability": "available|busy|sleeping|away",
+  "topic_seed": "适合自然展开的话题",
+  "next_update_at": "YYYY-MM-DD HH:MM",
+  "reply_delay_seconds": 0,
+  "reply_delay_reason": "无延迟则空字符串",
+  "reason": "event_normalized"
+}}"""
+
+
+def _format_circadian_for_prompt(profile: CircadianProfile | None, now: datetime) -> str:
+    """把作息画像格式化成一段供 prompt 用的描述。"""
+    if profile is None or profile.sample_size < 30:
+        return "（无可用画像，沿用默认作息：清醒 8:00-23:00；如对方实际是夜猫子或跨时区，请根据聊天内容自行调整）"
+    is_weekend = now.weekday() >= 5
+    label = "周末" if is_weekend else "工作日"
+    hourly = profile.weekend_hourly if is_weekend else profile.weekday_hourly
+    if not any(hourly):
+        hourly = profile.hourly_activity
+    # 取活跃度 >= 0.3 的小时列出来
+    active_hours = [str(h) for h, v in enumerate(hourly) if v >= 0.3]
+    active_text = "、".join(f"{h}点" for h in active_hours) if active_hours else "（数据稀疏）"
+    start, end = profile.typical_awake_range
+    return (
+        f"- 通常清醒时段：{start:02d}:00 - {end:02d}:00\n"
+        f"- 深夜活跃占比：{profile.night_owl_score:.0%}"
+        f"（{'明显夜猫子' if profile.night_owl_score >= 0.4 else '偏晚睡型' if profile.night_owl_score >= 0.2 else '常规作息'}）\n"
+        f"- 今天是{label}，历史上活跃的小时：{active_text}\n"
+        f"- 备注：{profile.summary}"
+    )
+
+
+def _render_analysis_life_profile(raw: object) -> str:
+    if not isinstance(raw, dict):
+        return ""
+    habits = raw.get("habits")
+    if not isinstance(habits, list):
+        return ""
+
+    candidates: list[tuple[float, str]] = []
+    category_labels = {
+        "sleep": "作息",
+        "meal": "饮食",
+        "activity": "活动",
+        "availability": "忙闲",
+    }
+    for habit in habits:
+        if not isinstance(habit, dict):
+            continue
+        confidence = habit.get("confidence")
+        if (
+            habit.get("subject") != "friend"
+            or habit.get("sensitive_relationship_context") is True
+            or not isinstance(confidence, int | float)
+            or isinstance(confidence, bool)
+            or confidence < _ANALYSIS_LIFE_MIN_CONFIDENCE
+        ):
+            continue
+        target_fields = habit.get("target_fields")
+        claim = " ".join(str(habit.get("claim") or "").split()).strip()
+        if not claim or not isinstance(target_fields, list) or not target_fields:
+            continue
+        time_patterns = habit.get("time_patterns")
+        times = (
+            "、".join(str(item) for item in time_patterns[:2] if str(item).strip())
+            if isinstance(time_patterns, list)
+            else ""
+        )
+        fields = "、".join(str(item) for item in target_fields[:4] if str(item).strip())
+        category = category_labels.get(str(habit.get("category") or ""), "日常")
+        time_part = f"；常见时段：{times}" if times else ""
+        candidates.append(
+            (
+                float(confidence),
+                f"- [{category}，{round(float(confidence) * 100)}%] {claim}"
+                f"{time_part}；可影响：{fields}",
+            )
+        )
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    selected = candidates[:_ANALYSIS_LIFE_MAX_HABITS]
+    if not selected:
+        return ""
+    return "\n".join(
+        [
+            "以下是目标角色的高置信度长期生活候选，不是今天事实；当前时间、当天状态和本轮对话优先。",
+            *(line for _, line in selected),
+        ]
+    )
+
+
+def _speaker(settings: Settings, role: str) -> str:
+    if role == "user":
+        return settings.self_name or "用户"
+    if role == "assistant":
+        return settings.friend_name or "TA"
+    return "系统"
+
+
+def _should_update_state(
+    *,
+    settings: Settings,
+    state: dict[str, Any],
+    before: LifeSnapshot,
+    now: datetime,
+    current_user_text: str,
+    trigger: str,
+    circadian: CircadianProfile | None = None,
+) -> bool:
+    current = state.get("current")
+    if not isinstance(current, dict):
+        return True
+    if trigger.startswith("proactive") and trigger != "proactive:manual":
+        return True
+    if _is_stale_current(current, now, settings.life_update_interval_minutes):
+        return True
+    next_update = _parse_next_update(str(current.get("next_update_at") or ""))
+    if next_update is None or now >= next_update:
+        return True
+    text = current_user_text.strip()
+    if not text:
+        return False
+    if before.availability == "sleeping":
+        return True
+    if _contains_any(text, _LIFE_INTERRUPT_PATTERNS):
+        return True
+    # 深夜熬夜判定：根据 circadian profile 而非硬编码 22-06，
+    # 这样夜猫子 TA 的"对方的深夜"自然偏移到凌晨更深的时段
+    if is_night_hour_for_profile(now.hour, circadian) and _contains_any(text, _USER_NIGHT_PATTERNS):
+        return True
+    return False
+
+
+def _is_stale_current(current: dict[str, Any], now: datetime, interval_minutes: int) -> bool:
+    if interval_minutes <= 0:
+        return False
+    raw = str(current.get("updated_at") or "")
+    if not raw:
+        return False
+    try:
+        updated_at = datetime.fromisoformat(raw)
+    except ValueError:
+        return True
+    if updated_at.tzinfo is not None and now.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=None)
+    elif updated_at.tzinfo is None and now.tzinfo is not None:
+        now = now.replace(tzinfo=None)
+    return now - updated_at >= timedelta(minutes=interval_minutes)
+
+
+def _event_for_now(state: dict[str, Any], now: datetime) -> dict[str, str] | None:
+    plan = state.get("daily_plan")
+    if not isinstance(plan, list):
+        return None
+    for item in plan:
+        if not isinstance(item, dict):
+            continue
+        start = _parse_next_update(str(item.get("from") or ""))
+        end = _parse_next_update(str(item.get("to") or ""))
+        if start is None or end is None:
+            continue
+        if start <= now <= end:
+            return {str(k): str(v) for k, v in item.items()}
+    return None
+
+
+def _summarize_daily_plan(state: dict[str, Any], limit: int = 6) -> str:
+    plan = state.get("daily_plan")
+    if not isinstance(plan, list):
+        return ""
+    parts: list[str] = []
+    for item in plan[:limit]:
+        if not isinstance(item, dict):
+            continue
+        start = _time_only(str(item.get("from") or ""))
+        end = _time_only(str(item.get("to") or ""))
+        activity = str(item.get("activity") or "").strip()
+        availability = str(item.get("availability") or "").strip()
+        if not activity:
+            continue
+        time_range = f"{start}-{end}" if start and end else ""
+        label = f"{time_range} {activity}".strip()
+        if availability:
+            label = f"{label}（{_availability_label(availability)}）"
+        parts.append(label)
+    return "；".join(parts)
+
+
+def _summarize_recent_timeline(state: dict[str, Any], limit: int = 4) -> str:
+    timeline = state.get("timeline")
+    if not isinstance(timeline, list):
+        return ""
+    parts: list[str] = []
+    for item in timeline[-limit:]:
+        if not isinstance(item, dict):
+            continue
+        at = _time_only(str(item.get("at") or ""))
+        activity = str(item.get("activity") or "").strip()
+        meal = str(item.get("meal") or "").strip()
+        if not activity:
+            continue
+        bit = f"{at} {activity}".strip()
+        if meal:
+            bit = f"{bit}，{meal}"
+        parts.append(bit)
+    return "；".join(parts)
+
+
+def _time_only(value: str) -> str:
+    parsed = _parse_next_update(value)
+    if parsed is None:
+        return ""
+    return parsed.strftime("%H:%M")
+
+
+def _availability_label(value: str) -> str:
+    labels = {
+        "available": "可回",
+        "busy": "忙",
+        "sleeping": "睡觉",
+        "away": "离开",
+    }
+    return labels.get(value, value)
+
+
+def _contains_any(text: str, patterns: tuple[str, ...]) -> bool:
+    return any(p in text for p in patterns)
+
+
+def _looks_woken_up(activity: str) -> bool:
+    """activity 文本是否像"被叫醒/半醒"。
+
+    用于 sleeping 状态下区分"在熟睡"与"被消息戳醒/半梦半醒"，
+    后者下一次状态更新时间要压短，以便没新消息时自然回到熟睡。
+    """
+    if not activity:
+        return False
+    return any(p in activity for p in _WOKEN_ACTIVITY_PATTERNS)
+
+
+def _fallback_availability(now: datetime) -> str:
+    if 0 <= now.hour < 7:
+        return "sleeping"
+    return "available"
+
+
+def _normalize_availability(value: object) -> str:
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in _AVAILABILITY_VALUES:
+            return lowered
+    return "available"
+
+
+def _normalize_reply_delay(value: object, *, max_seconds: int) -> int:
+    try:
+        delay = int(float(str(value)))
+    except (TypeError, ValueError):
+        delay = 0
+    return max(0, min(delay, max_seconds))
+
+
+def _normalize_next_update(
+    value: object,
+    *,
+    now: datetime,
+    availability: str,
+) -> datetime:
+    parsed = _parse_next_update(str(value or ""))
+    if parsed is None:
+        parsed = _default_next_update(now, availability)
+    min_dt = now + _MIN_UPDATE_INTERVAL
+    max_dt = now + _MAX_UPDATE_INTERVAL
+    if parsed < min_dt:
+        return min_dt
+    if parsed > max_dt:
+        return max_dt
+    return parsed
+
+
+def _normalize_daily_plan(value: object) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    out: list[dict[str, str]] = []
+    required = ("id", "from", "to", "activity", "availability", "topic")
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        row: dict[str, str] = {}
+        for key in required:
+            raw = item.get(key)
+            if not isinstance(raw, str) or not raw.strip():
+                row = {}
+                break
+            row[key] = raw.strip()[:_MAX_FIELD_CHARS]
+        if not row:
+            continue
+        if _parse_next_update(row["from"]) is None or _parse_next_update(row["to"]) is None:
+            continue
+        row["availability"] = _normalize_availability(row["availability"])
+        out.append(row)
+    return out[:12]
+
+
+def _parse_next_update(value: str) -> datetime | None:
+    text = value.strip()
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(text[:19], fmt)
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _default_next_update(now: datetime, availability: str) -> datetime:
+    if availability == "sleeping":
+        wake_hour = 8
+        target = now.replace(hour=wake_hour, minute=0, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        return target
+    for hour in (11, 14, 18, 23):
+        target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+        if target > now:
+            return target
+    return (now + timedelta(days=1)).replace(hour=8, minute=0, second=0, microsecond=0)
+
+
+def _format_dt(value: datetime) -> str:
+    return value.strftime("%Y-%m-%d %H:%M")
+
+
+def _text_field(value: object, fallback: str) -> str:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return fallback
+
+
+def _parse_decision(raw: str) -> dict[str, object] | None:
+    data = _extract_json_object(raw)
+    if not isinstance(data, dict):
+        return None
+    if data.get("apply") is False:
+        return None
+    mapping = {
+        "current_activity": "current_activity",
+        "current_event_id": "current_event_id",
+        "recent_meal": "recent_meal",
+        "mood": "mood",
+        "availability": "availability",
+        "topic_seed": "topic_seed",
+        "next_update_at": "next_update_at",
+        "reply_delay_reason": "reply_delay_reason",
+        "reason": "reason",
+    }
+    out: dict[str, object] = {}
+    for src, dst in mapping.items():
+        value = data.get(src)
+        if isinstance(value, str):
+            cleaned = " ".join(value.split()).strip()
+            if cleaned:
+                out[dst] = cleaned[:_MAX_FIELD_CHARS]
+    delay = data.get("reply_delay_seconds")
+    if isinstance(delay, int | float | str):
+        out["reply_delay_seconds"] = delay
+    daily_plan = data.get("daily_plan")
+    if isinstance(daily_plan, list):
+        out["daily_plan"] = daily_plan
+    return out
+
+
+def _extract_json_object(raw: str) -> object | None:
+    text = raw.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.lower().startswith("json"):
+            text = text[4:].strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    try:
+        return cast(object, json.loads(text[start : end + 1]))
+    except json.JSONDecodeError:
+        return None

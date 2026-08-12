@@ -1,0 +1,47 @@
+/.claude
+/开发缓存
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+.coverage
+htmlcov/
+
+# Backend 运行时数据
+backend/.data/
+backend/.env
+backend/imports/
+
+# Node / 前端（预留）
+node_modules/
+dist/
+.vite/
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+.DS_Store
+/website
+backend/.env copy
+/backend/.env-backups
+backend/scripts/diag_life.py
+backend/scripts/diag_rerank.py
+backend/scripts/test_proactive_poll.py
+/wiki
+backend/.env COPY1
+
+# 隐私与调试（不入库）
+HANDOFF.md
+backend/_bench.py

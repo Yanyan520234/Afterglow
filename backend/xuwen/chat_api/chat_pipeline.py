@@ -1,0 +1,414 @@
+"""chat / responses 路由共享的 helper。
+
+只放真正会跨路由复用的小函数；大段业务逻辑（图片处理、检索、决策、prompt 构建）
+仍保留在各路由内部，重复代码可控。下次重构再统一。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+from dataclasses import dataclass
+
+from xuwen.chat_api.llm_client import LLMClient
+from xuwen.chat_api.schemas import PolicyHint
+from xuwen.chat_api.sticker_store import StickerStore
+from xuwen.companion.life import (
+    LIFE_EVENT_TEXT_MAX_CHARS,
+    LifeSnapshot,
+    LifeStateManager,
+)
+from xuwen.companion.response_policy import ResponseDecision
+from xuwen.config import Settings
+from xuwen.core.metrics import MetricsRecorder
+
+logger = logging.getLogger(__name__)
+
+# 主模型输出自然语言 <life-event>；旧 <life-update> 仅保留输入兼容。
+_LIFE_MARKER_RE = re.compile(
+    r"<life-(event|update)>\s*(.*?)\s*</life-\1>",
+    re.DOTALL | re.IGNORECASE,
+)
+
+# Feature #9：主模型在回复中可输出 <schedule-hint>明天早上7点叫我起床</schedule-hint>
+# 表达定时任务意图。流结束后由 schedule_extractor 小模型解析为结构化 ScheduleTask。
+_SCHEDULE_HINT_RE = re.compile(
+    r"<schedule-hint>\s*(.*?)\s*</schedule-hint>",
+    re.DOTALL | re.IGNORECASE,
+)
+
+# 需本人处理协议：主模型输出 <need-owner>对方邀约内容</need-owner>，
+# 表示这是需要现实中的本人决定/履约的邀约或请求，后端剥离后回传给调用方。
+_NEED_OWNER_RE = re.compile(
+    r"<need-owner>\s*(.*?)\s*</need-owner>",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def extract_schedule_hints(assistant_text: str, *, max_hints: int = 5) -> list[str]:
+    """从 assistant_text 中抽取 <schedule-hint> 块内的自然语言时间意图。
+
+    返回去除首尾空白、去重、最多 max_hints 条的列表；没有命中时返回空列表。
+    本函数纯文本处理，不调用任何 LLM；调用 schedule_extractor 之前的轻量预筛。
+    """
+    if not assistant_text:
+        return []
+    hints: list[str] = []
+    seen: set[str] = set()
+    for raw in _SCHEDULE_HINT_RE.findall(assistant_text):
+        hint = raw.strip()
+        if not hint or hint in seen:
+            continue
+        seen.add(hint)
+        hints.append(hint)
+        if len(hints) >= max_hints:
+            break
+    return hints
+
+
+def extract_need_owner_hints(assistant_text: str, *, max_hints: int = 5) -> list[str]:
+    """从 assistant_text 中抽取 <need-owner> 块内的自然语言邀约/请求内容。
+
+    返回去除首尾空白、去重、最多 max_hints 条的列表；没有命中时返回空列表。
+    与 schedule-hint 一样是纯文本处理，不调用任何 LLM。
+    """
+    if not assistant_text:
+        return []
+    hints: list[str] = []
+    seen: set[str] = set()
+    for raw in _NEED_OWNER_RE.findall(assistant_text):
+        hint = raw.strip()
+        if not hint or hint in seen:
+            continue
+        seen.add(hint)
+        hints.append(hint)
+        if len(hints) >= max_hints:
+            break
+    return hints
+
+
+# 发图协议：主模型输出 <send-image>检索关键词</send-image>，桥接据此从本地图库检索发图。
+_SEND_IMAGE_RE = re.compile(
+    r"<send-image>\s*(.*?)\s*</send-image>",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def extract_send_image_hints(assistant_text: str, *, max_hints: int = 3) -> list[str]:
+    """从 assistant_text 中抽取 <send-image> 块内的图库检索关键词。
+
+    返回去除首尾空白、去重、最多 max_hints 条的列表；没有命中时返回空列表。
+    纯文本处理，不调用任何 LLM。
+    """
+    if not assistant_text:
+        return []
+    hints: list[str] = []
+    seen: set[str] = set()
+    for raw in _SEND_IMAGE_RE.findall(assistant_text):
+        hint = raw.strip()
+        if not hint or hint in seen:
+            continue
+        seen.add(hint)
+        hints.append(hint)
+        if len(hints) >= max_hints:
+            break
+    return hints
+
+
+# 邀约/现实请求的规则兜底：主模型没输出 <need-owner> 时，用关键词判断对方是否在邀约。
+# 命中则生成通用提醒，避免漏掉"需要本人决定/履约"的现实邀约。
+# 仅作兜底，模型已输出时以模型为准。
+_INVITE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"来打|打一把|开黑|上号|打王者|打永劫|一起打"),
+    re.compile(r"出来(吃|玩|喝|见)|一起(吃|玩|去|出门)|出去(玩|吃|逛)"),
+    re.compile(r"约(会|饭|一下|个|吗|不)|(请|叫)你(吃|喝|去)"),
+    re.compile(r"帮我(带|买|办|拿|做|取|填)|帮我个忙|麻烦你(帮|带|买)"),
+    re.compile(r"发个红包|转(你|我)钱|给你(发|转)|送(我|你)(个|点)"),
+    re.compile(r"什么时候(去|来|见)|明天(去|来|见)|今晚(去|来|见)"),
+)
+
+
+def rule_fallback_need_owner(user_text: str) -> list[str]:
+    """纯规则兜底：用户消息命中邀约/现实请求关键词时返回提醒列表。
+
+    返回形如 ["对方约我打游戏"] 的通用诉求描述；未命中返回空列表。
+    """
+    if not user_text:
+        return []
+    text = user_text.strip()
+    hints: list[str] = []
+    if any(p.search(text) for p in (_INVITE_PATTERNS[0],)):
+        hints.append("对方约我打游戏")
+    if any(p.search(text) for p in (_INVITE_PATTERNS[1], _INVITE_PATTERNS[2])):
+        hints.append("对方约我出去（见面/吃饭/玩）")
+    if any(p.search(text) for p in (_INVITE_PATTERNS[3],)):
+        hints.append("对方让我帮忙办件事")
+    if any(p.search(text) for p in (_INVITE_PATTERNS[4],)):
+        hints.append("对方让我答应送东西/转钱")
+    if any(p.search(text) for p in (_INVITE_PATTERNS[5],)):
+        hints.append("对方在约时间（赴约/见面）")
+    # 去重
+    seen: set[str] = set()
+    out: list[str] = []
+    for h in hints:
+        if h not in seen:
+            seen.add(h)
+            out.append(h)
+    return out
+
+
+def build_policy_hint(
+    decision: ResponseDecision,
+    *,
+    reply_delay_seconds: int = 0,
+    reply_delay_reason: str = "",
+) -> PolicyHint:
+    """把 ResponseDecision 映射成 OpenAI 响应里附带的 PolicyHint。"""
+    return PolicyHint(
+        should_reply=decision.should_reply,
+        reply_mode=decision.reply_mode,
+        user_state=decision.user_state,
+        risk_level=decision.risk_level,
+        reason=decision.derived_reason(),
+        reply_delay_seconds=max(0, reply_delay_seconds),
+        reply_delay_reason=reply_delay_reason if reply_delay_seconds > 0 else "",
+    )
+
+
+def effective_reply_delay_seconds(
+    *,
+    life: LifeSnapshot,
+    decision: ResponseDecision,
+    settings: Settings,
+) -> int:
+    """计算本轮建议给客户端执行的延迟秒数。
+
+    沉默场景延迟=0；其它情况取 life / decision 两者较大值。
+    availability=sleeping 时若模型/规则层都没给延迟，启用兜底（避免 sleeping 秒回）。
+    """
+    if not decision.should_reply:
+        return 0
+    raw = max(life.reply_delay_seconds, decision.reply_delay_seconds)
+    # sleeping 兜底：模型不一定每次都听 prompt 给 5-45 秒，这里强制最小值。
+    if life.availability == "sleeping":
+        floor = max(0, settings.life_sleeping_min_reply_delay_seconds)
+        if floor > 0:
+            raw = max(raw, floor)
+    return max(0, min(raw, settings.life_max_reply_delay_seconds))
+
+
+@dataclass(frozen=True, slots=True)
+class LifeEventExtraction:
+    text: str
+    events: tuple[str, ...]
+
+
+def extract_life_events(
+    assistant_text: str,
+    *,
+    max_events: int = 5,
+) -> LifeEventExtraction:
+    """剥离内部 life 协议并返回去重后的事件内容，不产生副作用。"""
+    if not assistant_text:
+        return LifeEventExtraction(text=assistant_text, events=())
+    events: list[str] = []
+    seen: set[str] = set()
+    total_chars = 0
+    for _kind, raw in _LIFE_MARKER_RE.findall(assistant_text):
+        event = " ".join(raw.split()).strip()
+        if not event or event in seen:
+            continue
+        separator_chars = 1 if events else 0
+        remaining = LIFE_EVENT_TEXT_MAX_CHARS - total_chars - separator_chars
+        if remaining <= 0:
+            break
+        event = event[: min(1200, remaining)]
+        seen.add(event)
+        events.append(event)
+        total_chars += separator_chars + len(event)
+        if len(events) >= max_events:
+            break
+    return LifeEventExtraction(
+        text=_LIFE_MARKER_RE.sub("", assistant_text).strip(),
+        events=tuple(events),
+    )
+
+
+def schedule_life_events(
+    events: tuple[str, ...],
+    life: LifeStateManager,
+    *,
+    enabled: bool,
+    llm: LLMClient,
+    model: str,
+    apply_lock: asyncio.Lock,
+    pending_tasks: set[asyncio.Task[None]] | None = None,
+    assistant_text: str = "",
+    current_user_text: str = "",
+    trace_id: str = "",
+    metrics: MetricsRecorder | None = None,
+) -> None:
+    """把最终采用回复中的生活事件交给 Life 模型异步归一化。"""
+    if not enabled or not events:
+        return
+
+    async def _apply_async() -> None:
+        try:
+            async with apply_lock:
+                await asyncio.wait_for(
+                    life.apply_event(
+                        llm=llm,
+                        model=model,
+                        event_text="\n".join(events),
+                        assistant_text=assistant_text,
+                        current_user_text=current_user_text,
+                        trace_id=trace_id,
+                        metrics=metrics,
+                    ),
+                    timeout=life.settings.life_timeout_seconds,
+                )
+        except TimeoutError:
+            logger.warning(
+                "life event 归一化超时 %.1fs，保留原状态",
+                life.settings.life_timeout_seconds,
+            )
+        except Exception:
+            logger.warning("life event 归一化失败，保留原状态", exc_info=True)
+
+    task = asyncio.create_task(_apply_async())
+    if pending_tasks is not None:
+        pending_tasks.add(task)
+        task.add_done_callback(pending_tasks.discard)
+
+
+def available_sticker_names(settings: Settings) -> frozenset[str] | None:
+    """收集 AI 当前实际能用的 sticker 名字集合。
+
+    输出层会用这个集合校验 `[sticker:xxx]`：xxx 不在集合内就剥离，
+    避免模型自创不存在的 sticker 让前端渲染失败。
+
+    读取失败返回 None（不做校验，避免误伤）；读取成功但没有可用 sticker
+    返回空集，输出层会剥离所有 `[sticker:...]`。
+    """
+    try:
+        store = StickerStore(settings)
+        return frozenset(s.name for s in store.available_for_ai())
+    except Exception:
+        logger.warning("收集可用 sticker 名字失败，跳过 sticker 校验", exc_info=True)
+        return None
+
+
+# 当模型只发了不存在的 sticker、被输出过滤拦截后，sanitize 会兜底成 "嗯"。
+# 但 "嗯" 跟 sticker 的语气完全不匹配（撒娇/玩梗时尤其奇怪）。
+# 这里按 reply_mode 给一个更贴合本轮模式的短句。
+_STICKER_REJECT_FALLBACK_BY_MODE: dict[str, str] = {
+    "clingy": "嘿嘿",
+    "intimate": "嘿嘿",
+    "playful": "哈哈",
+    "tease": "哈哈",
+    "joking": "草",
+    "chaotic": "……",
+    "serious": "嗯嗯",
+    "calm": "嗯嗯",
+    "topic_shift": "嗯",
+    "image": "唔",
+    "sticker": "唔",
+    "silence": "",
+}
+
+
+def fallback_for_rejected_sticker(reply_mode: str) -> str:
+    """模型只输出了不存在的 sticker，被剥离后该用什么短句替代干瘪的"嗯"。
+
+    参数是 reply_mode 字符串，方便流式分支用 PolicyHint.reply_mode 直接调用。
+    """
+    return _STICKER_REJECT_FALLBACK_BY_MODE.get(reply_mode, "……")
+
+
+def is_ai_silence_signal(
+    assistant_text: str,
+    *,
+    sentinel: str,
+    decision: ResponseDecision,
+) -> bool:
+    """判断主模型是否选择了"沉默"出口。
+
+    判定规则：
+    - sentinel 非空；
+    - sanitize 后的整段文本 strip() 等于 sentinel（不允许任何额外字符）；
+    - 决策不处于 unsafe（unsafe 场景下 AI 必须回复，sentinel 直接忽略当文本处理）；
+    - 决策本来 should_reply=True 且 reply_mode!="silence"（规则层已强制沉默
+      的场景走自己的短路，不进入这里）。
+
+    严格匹配是为了避免模型把 sentinel 当成正文一部分顺手输出导致误吞回复。
+    """
+    if not sentinel:
+        return False
+    if not assistant_text:
+        return False
+    if assistant_text.strip() != sentinel:
+        return False
+    if decision.user_state == "unsafe":
+        return False
+    if not decision.should_reply or decision.reply_mode == "silence":
+        return False
+    return True
+
+
+def effective_silence_sentinel(settings: Settings) -> str:
+    """返回当前生效的沉默 sentinel；AI 自主沉默被开关关闭时返回空串。
+
+    传空串给 render_prompt_block → 不注入沉默指令；
+    传空串给 is_ai_silence_signal → 第一道守卫直接返回 False。
+    一个开关同时关掉 prompt 入口和 pipeline 兜底，避免散点漏改。
+    """
+    if not settings.ai_silence_enabled:
+        return ""
+    return settings.silence_response_sentinel
+
+
+def looks_like_sticker_only_intent(raw_text: str) -> bool:
+    """判断模型原始输出是否"基本只是想发 sticker"。
+
+    判断规则：原文含 [sticker:，把所有 sticker 占位剥掉后剩下的内容非常少
+    （少于 2 个有效字符），认为模型本意就是用 sticker 表达。
+    """
+    if "[sticker:" not in raw_text:
+        return False
+    # 同 output_filter._FULL_STICKER_TOKEN_RE，去掉所有 sticker token
+    no_stickers = re.sub(r"\[sticker(?::|=)[^\]\s]+\]", "", raw_text)
+    # 同时去掉未闭合的尾巴和常见标点
+    no_stickers = re.sub(r"\[sticker(?::|=)[^\]\s]*$", "", no_stickers)
+    no_stickers = re.sub(r"[\s,，.。:：;；、~～!！?？…·\-—]+", "", no_stickers)
+    return len(no_stickers) < 2
+
+
+def build_sticker_retry_hint(
+    raw_text: str,
+    available_names: frozenset[str],
+) -> str:
+    """构造一条 system 消息提示，告诉主模型刚才输出的 sticker 不在库里，请重新组织。
+
+    用作 retry 时追加到 messages 末尾。available_names 为空时明确告诉模型
+    "当前完全没有可用 sticker"，避免它继续乱猜。
+    """
+    rejected = sorted({
+        m.group(1)
+        for m in re.finditer(r"\[sticker(?::|=)([^\]\s]+)\]", raw_text)
+        if m.group(1) not in available_names
+    })
+    rejected_text = "、".join(f"[sticker:{n}]" for n in rejected) or "（未识别）"
+    if available_names:
+        allowed = "、".join(f"[sticker:{n}]" for n in sorted(available_names))
+        return (
+            f"你刚才输出了系统里**不存在**的 sticker：{rejected_text}。"
+            f"当前可用的 sticker 仅有：{allowed}。"
+            "请用文字（或上面列出的名字一字不差地使用）重新回复用户的上一条消息；"
+            "**不要**再输出自创的 sticker 名字。"
+        )
+    return (
+        f"你刚才输出了系统里**不存在**的 sticker：{rejected_text}。"
+        "当前完全没有可用 sticker。请改用文字（或 emoji）重新回复用户的上一条消息；"
+        "**不要**再输出 `[sticker:...]` 格式。"
+    )
