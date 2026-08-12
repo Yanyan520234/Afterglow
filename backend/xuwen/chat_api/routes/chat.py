@@ -14,6 +14,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from xuwen.chat_api import turn_service
 from xuwen.chat_api.chat_pipeline import (
     available_sticker_names,
     build_policy_hint,
@@ -30,10 +31,7 @@ from xuwen.chat_api.chat_pipeline import (
     rule_fallback_need_owner,
     schedule_life_events,
 )
-from xuwen.chat_api.companion_prompt import (
-    build_persona_card_with_companion_context,
-    render_life_memory_context_from_recent,
-)
+from xuwen.chat_api.companion_prompt import render_life_memory_context_from_recent
 from xuwen.chat_api.image_store import ImageError, save_data_url
 from xuwen.chat_api.llm_client import GenerationParams
 from xuwen.chat_api.output_filter import AssistantOutputFilter, sanitize_assistant_text
@@ -72,7 +70,6 @@ from xuwen.core.time import local_now
 from xuwen.ingestion.image_importer import _usable_image_description
 from xuwen.memory.writer import WritebackTurn
 from xuwen.persona.prompt import ChatMessage as PromptMessage
-from xuwen.persona.prompt import build_chat_messages
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["chat"])
@@ -579,48 +576,27 @@ async def chat_completions(
     )
     fetch_many_task: asyncio.Task[str] = asyncio.create_task(_fetch_many_or_skip(fetch_urls))
 
-    persona_card = build_persona_card_with_companion_context(
-        settings=state.settings,
+    persona_card = await turn_service.build_persona_card(
+        state,
         life=life,
         relationship_context=relationship_block,
         style_query=current_user_text,
-        response_policy_context=response_decision.render_prompt_block(
-            silence_sentinel=effective_silence_sentinel(state.settings),
-        ),
-        # 本路由（ChatCompletions）会调用 schedule_extractor 并回传 schedule_tasks，
-        # 所以可以安全地教 AI 输出 <schedule-hint>。Responses / Companion 路由
-        # 未接入提取链路，传 False（默认）以免任务被静默丢失。
-        include_schedule_hint=True,
+        decision=response_decision,
+        include_schedule_hint=True,  # 仅本路由（不变量③）
     )
     # 等 Layer B 起的 fetch_many 跑完。如果 prompt 组装已盖住 fetch RTT，这里 await 接近 0ms。
     url_context = await fetch_many_task
 
-    messages = build_chat_messages(
-        settings=state.settings,
+    messages = await turn_service.build_messages(
+        state,
         persona_card=persona_card,
         retrieved=retrieved,
         recent=recent,
         current_user_message=current_user_text or "（图片）",
         web_context=web_context,
         url_context=url_context,
+        images=images_in_last or None,
     )
-
-    if (
-        images_in_last
-        and state.settings.chat_model_supports_vision
-        and messages
-        and messages[-1]["role"] == "user"
-    ):
-        text_for_user = messages[-1]["content"]
-        if isinstance(text_for_user, str):
-            multimodal_content: list[dict[str, Any]] = [
-                {"type": "text", "text": text_for_user},
-            ]
-            for url in images_in_last:
-                multimodal_content.append(
-                    {"type": "image_url", "image_url": {"url": url}}
-                )
-            messages[-1] = {"role": "user", "content": multimodal_content}  # type: ignore[dict-item]
 
     params = GenerationParams(
         temperature=req.temperature,

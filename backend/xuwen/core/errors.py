@@ -66,6 +66,13 @@ class RetrievalError(XuwenError):
     http_status = 500
 
 
+class RetrievalTimeout(RetrievalError):
+    """检索超时（适配层可据此决定 504 或降级）。"""
+
+    code = "xuwen.retrieval.timeout"
+    http_status = 504
+
+
 class LLMError(XuwenError):
     """对话模型上游错误。"""
 
