@@ -90,9 +90,9 @@ companion.py（1135，不动）
 |---|---|---|---|
 | S0 | 基线：ruff + mypy + 全量 pytest 全绿；开分支 `refactor/turn-service`；盘点 turn_coordinator | 全绿 | （No commit） |
 | PR1 | mock helper → conftest；新增 `tests/integration/test_protocol_parity.py`：①三路由同输入→回复文本/`policy.should_reply·reply_mode`/trace_id 一致 ②silence 一致性 ③上游 messages 全量指纹 ④副作用断言（writeback/metrics/responses_store）⑤异常注入矩阵（LLM 500·超时·embedding失败 × chat+responses，chat=504/503 vs responses=降级）⑥参数化裸测（VLM 注入格式 / 检索失败两语义） | 新测试绿 | `test(chat): 协议一致性安全网（先行）` |
-| — | PR1 合后打 tag `legacy-pre-refactor` | — | tag |
+| — | PR1 合后打 tag `legacy-pre-refactor` | — | ✅ done |
 | PR2 | S2 纯搬迁：turn_service 骨架 + 路由 re-export 保兼容；turn_coordinator 按决策 2 引用式吸收 | 全量 0 回归 | `refactor(chat): 共享编排层纯搬迁` |
-| PR3 | S3 收敛：按定稿 API 实现；"空结果不抛/错误抛 RetrievalError"；chat/responses 变薄；守 12 条不变量；修正测试耦合点 | 全量 + parity 绿 | `refactor(chat): 收敛共享管道+适配层` |
+| PR3 | S3 收敛：按定稿 API 实现；"空结果不抛/错误抛 RetrievalError"；chat/responses 变薄；守 12 条不变量；修正测试耦合点 | 全量 + parity 绿 | `refactor(chat): 收敛共享管道+适配层` ✅ done（a671b0f / a7bea03 / 8fc7dca 增量） |
 | S6 | 全量 + parity 绿 → 隐私守卫 → push myrepo → 打 v0.3.7 | 全绿+守卫 | — |
 
 观察期（一周真实运行，零回归）→ 后续立项：
@@ -125,10 +125,14 @@ S3 若某条回归 → **立即回退该步提交，不掩盖**。
 
 ## 7. 交接清单 / 完成标记
 
+- [x] PR1（parity 安全网）单提交 `142cc79`，已打 tag `legacy-pre-refactor`
+- [x] PR2（turn_service 骨架）单提交 `00ab07f`
+- [x] PR3（S3 收敛）3 个增量提交 `a671b0f` / `a7bea03` / `8fc7dca`（增量切换已拍板）+ 文档提交
+- [ ] S6：全量 + parity 绿 → 隐私守卫 → push myrepo → 打 v0.3.7
+- [ ] 观察期一周零回归后：S4（SSE 拆文件）/ S5（companion 复用 policy_service）/ DEBUG_PARITY_DIFF ↔ `legacy-pre-refactor` 对拍立项
 - 每步提交遵循 Conventional Commits，且 ruff + mypy + pytest/parity 全绿才合
-- PR1/PR2/PR3 各自单一提交，可独立 cherry-pick / revert
+- PR1/PR2/PR3 提交可独立 cherry-pick / revert
 - S6 push 前跑隐私守卫（git ls-files / git grep QQ、密钥、聊天标记零命中）
-- 观察期一周零回归后，S4/S5/parity_diff 立项
 - 完成后更新本节状态，交接给下一个执行者
 
 ---

@@ -1,9 +1,9 @@
-# P1 一期重构 · 交接报告（S0-S2 验收通过）
+# P1 一期重构 · 交接报告（S0-S3 验收通过）
 
-> 最后更新：2026-08-13 00:30 · 由上一次执行 agent 交接
+> 最后更新：2026-08-13 · 由上一次执行 agent 交接
 > 本文件是 P1 重构的**执行状态交接**，与 `docs/p1-refactor-plan.md`（计划书）配对。
-> **下一个接手 P1 的 agent 必须先读：1) 本交给（现状+已验证）→ 2) 计划书（目标+不变量）→ 3) 下方「PR3 接力指南」。**
-> 验收结论见文末「七、验收记录」——S0-S2 全部可复现验证通过。
+> **下一个接手 P1 的 agent 必须先读：1) 本交给（现状+已验证）→ 2) 计划书（目标+不变量）→ 3) 下方「S6 接力指南」。**
+> 验收结论见文末「七、验收记录」——S0-S3 全部可复现验证通过。
 
 ---
 
@@ -11,11 +11,11 @@
 
 本仓库 `C:\Users\yang\clone bot\Afterglow` 正做 **P1 重构**：把 `chat.py` + `responses.py` 两条平行流水线收敛为「共享管道 `turn_service.py` + 薄适配层」，**行为零变化**。
 
-- 已完成：**S0 基线清理**、**PR1 parity 安全网（test_protocol_parity.py，6 项）**、**PR2 turn_service.py 骨架**
-- 下一步：**PR3 - 收敛共享管道 + 适配层**（最大单步，尚未开始动 chat.py / responses.py）
-- 当前分支：`refactor/turn-service`（含 PR1+PR2，工作树干净）
+- 已完成：**S0 基线清理**、**PR1 parity 安全网（test_protocol_parity.py，6 项）**、**PR2 turn_service.py 骨架**、**PR3 收敛（S3：chat.py + responses.py 已切换共享管道）**
+- 下一步：**S6 合流**（全量+parity 绿 → 隐私守卫 → push myrepo `Yanyan520234/Afterglow` → 打 v0.3.7），随后进入一周观察期
+- 当前分支：`refactor/turn-service`（含 PR1+PR2+PR3，工作树干净）
 - **红线**：12 条不变量（计划书第 6 章）+ parity 套件全绿是唯一裁判；任何回归立即回退该步提交
-- 遗留待办（不属 P1）：mypy 20 个既有错误（P5 处理）、隐私守卫脚本化、CI mypy
+- 遗留待办（不属 P1）：mypy 20 个既有错误（P5 处理）、隐私守卫脚本化、CI mypy；`DEBUG_PARITY_DIFF` 指纹钩子与 `scripts/parity_diff.py`（决策 8）留观察期做双实现对拍
 
 ---
 
@@ -32,6 +32,9 @@
 
 ```
 提交历史（refactor/turn-service）：
+8fc7dca refactor(responses): responses.py 切换共享管道（增量3）  ← PR3 第三增量
+a7bea03 refactor(chat): chat.py 切换共享 run_layer_a + decide_policy（增量2）
+a671b0f refactor(chat): chat.py 切换共享 persona_card + messages（增量1）
 00ab07f refactor(chat): 共享编排层纯搬迁          ← PR2
 142cc79 test(chat): 协议一致性安全网（先行）       ← PR1（已合入 main + 打了 tag）
 b5b2918 S0 基线清理: ruff 修复 + P1 计划书入库
@@ -39,11 +42,11 @@ b5b2918 S0 基线清理: ruff 修复 + P1 计划书入库
 ```
 
 分支关系：
-- `main` = 2eab2af → b5b2918 → 142cc79（**含 PR1，无 PR2**）
-- `refactor/turn-service` = main + 00ab07f（**含 PR1 + PR2**）
-- 即：`git log main..refactor/turn-service` 仅 `00ab07f` 一个提交
+- `main` = 2eab2af → b5b2918 → 142cc79（**含 PR1，无 PR2/PR3**）
+- `refactor/turn-service` = main + [PR2 + PR3×3]（**含 PR1 + PR2 + PR3**）
+- 即：`git log main..refactor/turn-service` 为 `00ab07f`、`a671b0f`、`a7bea03`、`8fc7dca`（另加本文档提交）
 
-> ⚠️ 提示：下一批 PR3 在 `refactor/turn-service` 分支上继续。最终合流时 PR2/PR3 一起快进/合入 main。
+> ⚠️ 提示：PR3 已完成于 `refactor/turn-service` 分支。**S6 合流时 PR2/PR3 一起快进/合入 main。**
 
 ---
 
@@ -111,6 +114,29 @@ b5b2918 S0 基线清理: ruff 修复 + P1 计划书入库
 
 **变更影响：** 只新增 1 个文件，chat.py / responses.py **完全没动**（re-export 只是符号存在，路由尚未切换）。
 
+### PR3 · S3 收敛（3 个增量提交 + 文档提交）
+
+**目标：达成「共享管道 + 薄适配层」目标形态，chat/responses 变薄，守 12 条不变量，parity 全绿。**
+
+**`turn_service.py`（120 → 379 行）共享管道 API：**
+- `LayerA(retrieved, relationship_block, life)` — Layer A 并发产物
+- `run_layer_a(state, *, route, retrieval_query, current_user_text, recent, conversation_id, trace_id, retrieval_fail_open=False, relationship_graceful_on_exception=False)`：
+  - 检索 `wait_for` 包裹；`retrieval_fail_open=False`（chat）→ 超时抛 `RetrievalTimeout` / 失败透传 `RetrievalError`；`=True`（responses）→ 降级 `empty_retrieval_result` 继续，且关系记忆/life 照常并发计算（**与原 responses gather 语义一致，不丢并发产物**）
+  - 关系记忆超时降级空串；`relationship_graceful_on_exception=True` 时非 Timeout 异常也降级（responses），False 时向上抛（chat 原语义）
+  - life 超时沿用 snapshot；`route` 参数化 metric 前缀与 `trigger`
+- `decide_policy(...) → (decision, policy_hint)` — 规则层 + 可选 LLM refine + 延迟/`policy_hint` 统一产
+- `build_persona_card(..., include_schedule_hint=False)` — 仅 chat 传 True（不变量③）
+- `build_messages(..., images=None)` — `build_chat_messages` + 视觉多模态组装
+
+**适配层切换（每个增量以 parity/全量绿为验证关卡）：**
+- **增量1（a671b0f）**：chat.py persona_card + messages → 共享方法；清理未用导入
+- **增量2（a7bea03）**：chat.py Layer A → `run_layer_a(route="chat")`，`except RetrievalTimeout→504 / except RetrievalError→503`（不变量②）；决策段 → `decide_policy`；补 `RetrievalTimeout` import、清死代码
+- **增量3（8fc7dca）**：responses.py → `run_layer_a(route="responses", retrieval_fail_open=True, relationship_graceful_on_exception=True)`（检索失败降级）、`decide_policy`、`build_persona_card`（不传 schedule_hint）、`build_messages(images=last_user_images)`；清理 9 个未用导入 + 1 个死常量；修测试耦合点 `FakeRetriever` 改用 `companion_prompt.empty_retrieval_result`
+
+**行数收敛（`wc -l`）：** chat.py 1427 → 1182；responses.py 1181 → 963；turn_service.py → 379。
+
+**决策 8（DEBUG_PARITY_DIFF）**：本轮仅计划在 env 开关下加 stage 指纹钩子；考虑到探测语义未定稿且非本轮收敛的必要条件，**留观察期**与 `scripts/parity_diff.py` 一并做（观察期一周零回归后立项，见计划书 §5）。
+
 ---
 
 ## 三、验证记录（本次验收实际执行，全部可复现）
@@ -149,11 +175,13 @@ b5b2918 S0 基线清理: ruff 修复 + P1 计划书入库
 
 ---
 
-## 五、PR3 接力指南（重点！下一个 agent 从这里开始）
+## 五、PR3 接力指南（已完成，本指南存档）
+
+> ✅ **PR3（S3 收敛）已于 2026-08-13 完成**（见「二、已完成工作 → PR3」）。下列 5 步指引是执行时的方法论，历史有效；新 agent 已不需要从这里开始，去「S6 接力指南」（文末「七、验收记录」之后）。
 
 ### 当前状态
-- 分支 `refactor/turn-service`，基于 main（含 PR1）+ PR2，工作树干净
-- `turn_service.py` 只有骨架（format_sse / compact_debug_text / NopTurnContext / begin_turn），**没有共享管道 API**
+- 分支 `refactor/turn-service`，基于 main（含 PR1）+ PR2+PR3，工作树干净
+- `turn_service.py` 已含共享管道 API（run_layer_a / decide_policy / build_persona_card / build_messages / LayerA）
 
 ### PR3 第一步（建议，续「增量切换」已拍板）
 在 turn_service.py 实现**纯共享层**，让 chat.py 先切换：
@@ -223,7 +251,30 @@ build_messages(state, *, persona_card, retrieved, recent, current_user_message,
 ✅ integration:     88 passed（含 test_chat_api 29 + test_protocol_parity 6 + 其余）
 ✅ 工作树:          干净
 ✅ tag legacy-pre-refactor: 已打（指向 142cc79）
-✅ 分支结构:        main 含 PR1；refactor/turn-service 含 PR1+PR2；工作树干净
+✅ 分支结构:        main 含 PR1；refactor/turn-service 含 PR1+PR2+PR3；工作树干净
+✅ 12 条不变量:     逐条核对保持（差异留在适配层 or 共享层参数化）
 ```
 
-**S0 / PR1 / PR2 验收通过。下一个 PR3（收敛）从 `refactor/turn-service` 分支 + 本「五、PR3 接力指南」开始。**
+**S0 / PR1 / PR2 / PR3（S3 收敛）全部验收通过。**
+
+## 八、S6 接力指南（下一步，从这里开始）
+
+### 当前状态
+- 分支 `refactor/turn-service`，含 PR1+PR2+PR3（chat/responses 已收敛为共享管道 + 薄适配层），工作树干净
+- 下一步：**S6 合流**（计划书 §5）：全量 + parity 绿 → **隐私守卫** → **push myrepo `Yanyan520234/Afterglow`** → **打 v0.3.7**
+
+### S6 步骤（纪律）
+1. 最终验收：`python -m ruff check xuwen scripts tests` + `python -m pytest tests/unit tests/integration -q` 全绿
+2. **隐私守卫**（S6 强制关卡）：`git ls-files` / `git grep` 检查 QQ 号、真实密钥、聊天记录原始文本零命中；`backend/.env` 不入库（`.gitignore` 已排除，commit 前 `git status` 再核对）
+3. push 前 **临时注释 `.gitconfig` 的 `gh-proxy` insteadOf 重写**（推完还原）
+4. push：`git push myrepo refactor/turn-service`
+5. 打 tag：`git tag v0.3.7`（重构落地标记）+ push tag / 合 main
+6. 观察期（一周真实运行零回归）后立项：S4（SSE 拆文件）、S5（companion 复用 policy_service）、DEBUG_PARITY_DIFF ↔ `legacy-pre-refactor` 只读对拍
+
+### 已知坑（延续）
+1. 检索错误：chat 立即 raise（504/503）/ responses 降级——共享层用 `retrieval_fail_open` 区分，**不要**把它统一掉
+2. VLM 注入格式（chat=（…） vs responses=[图片X描述…]）与预算（逐张×张数 vs 单 timeout）仍在适配层，别归一化
+3. SSE 双线（`data:`+收尾字段 vs `event:`+`[DONE]`）保留在适配层，S4 才拆文件
+4. life `next_update_at` 时序噪声：parity 用稳定锚点断言，不逐字节全等
+5. 集成测试环境：`_settings()` 在 pytest 下 `xuwen_api_key=None`；命令行直接跑会 401（拿真实 .env key），诊断脚本写成 pytest
+6. `turn_coordinator` 永远引用 `state.turn_coordinator`，不在共享层 new 实例
