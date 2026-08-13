@@ -108,6 +108,7 @@ def build_chat_messages(
     current_user_message: str,
     web_context: str = "",
     url_context: str = "",
+    sticker_block: str = "",
 ) -> list[dict[str, str]]:
     """构造 OpenAI chat/completions 兼容的 messages 列表。
 
@@ -126,6 +127,7 @@ def build_chat_messages(
         current_user_message=current_user_message,
         web_context=web_context,
         url_context=url_context,
+        sticker_block=sticker_block,
     )
 
     messages: list[dict[str, str]] = [
@@ -146,6 +148,7 @@ def _render_system_prompt(
     current_user_message: str,
     web_context: str,
     url_context: str,
+    sticker_block: str = "",
 ) -> str:
     template = _load_template(settings)
     now = local_now(settings.app_timezone)
@@ -187,7 +190,8 @@ def _render_system_prompt(
         web_context=web_context,
         url_context=url_context,
     )
-    return (rendered + "\n\n" + runtime_context + _STYLE_GUARD).strip()
+    sticker_text = f"\n\n{sticker_block}" if sticker_block else ""
+    return (rendered + "\n\n" + runtime_context + sticker_text + _STYLE_GUARD).strip()
 
 
 def _load_template(settings: Settings) -> Template:

@@ -275,8 +275,39 @@ def test_build_messages_empty_user_raises():
             persona_card="",
             retrieved=_empty_result(),
             recent=[],
-            current_user_message="   ",
+            current_user_message="  ",
         )
+
+
+def test_sticker_block_injected_when_provided():
+    settings = _settings()
+    sticker_block = "【表情包】\n- [sticker:嘿嘿]：得意"
+    messages = build_chat_messages(
+        settings=settings,
+        persona_card="",
+        retrieved=_empty_result(),
+        recent=[],
+        current_user_message="哈哈",
+        sticker_block=sticker_block,
+    )
+    system = messages[0]["content"]
+    assert "【表情包】" in system
+    assert "[sticker:嘿嘿]" in system
+    assert "得意" in system
+
+
+def test_sticker_block_absent_when_not_provided():
+    settings = _settings()
+    messages = build_chat_messages(
+        settings=settings,
+        persona_card="",
+        retrieved=_empty_result(),
+        recent=[],
+        current_user_message="哈哈",
+    )
+    system = messages[0]["content"]
+    assert "【表情包】" not in system
+    assert "- [sticker:" not in system
 
 
 def test_all_builtin_templates_render():

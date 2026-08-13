@@ -300,5 +300,5 @@ def render_sticker_block_for_prompt(stickers: list[Sticker]) -> str:
         f"以上是当前**全部**可用名字：{names}。"
         "用名字一字不差地写出来，否则不要输出 `[sticker:...]` 这种格式——用文字代替。"
     )
-    lines.append("挑选要贴合语境的；不要为了发而发，文字回应优先。")
+    lines.append("聊天中情绪到位、玩梗应景时可以**偶尔主动**发一张贴合语境的，不必等对方开口要；但不要为了发而发，文字回应优先。")
     return "\n".join(lines)

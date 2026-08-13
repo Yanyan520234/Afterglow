@@ -27,6 +27,7 @@ from xuwen.chat_api.companion_prompt import (
 )
 from xuwen.chat_api.llm_client import GenerationParams
 from xuwen.chat_api.state import AppState
+from xuwen.chat_api.sticker_store import StickerStore, render_sticker_block_for_prompt
 from xuwen.companion.life import LifeSnapshot
 from xuwen.companion.response_policy import (
     ResponseDecision,
@@ -417,6 +418,9 @@ async def build_messages(
         current_user_message=current_user_message or "（图片）",
         web_context=web_context,
         url_context=url_context,
+        sticker_block=render_sticker_block_for_prompt(
+            StickerStore(state.settings).available_for_ai()
+        ),
     )
     if (
         images
