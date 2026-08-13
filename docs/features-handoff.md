@@ -43,9 +43,18 @@
 - 后端：`stt_client.SttClient`（OpenAI 兼容 `audio/transcriptions`，重试 3 次）+ 路由 `POST /v1/audio/transcriptions`（multipart `file`，503=未配置 / 400=空或超大 / 502=转写失败）。
 - `ChatCompletionRequest.voice_text`（可选）：非空时后端把最后一条 user 消息框成 `（对方发来一段语音：…）`（已有文本则追加），再走检索/LLM/写历史/隐私检测。
 - 桥接：`_record_segments` + `resolve_record_audio`（`get_record` 本地直读 → URL 下载兜底）+ `transcribe_voice`；转写成功 → `chat(voice_text=…)`；**后端 503（未配置）→ 保持旧行为（跳过，不回复）**；配置了但失败 → 回 `VOICE_FALLBACK_TEXT`（默认「语音我这边听不清 发文字哈」）。
+- **silk → wav 转码**：QQ 语音是腾讯私有 silk，云端 ASR（含 SenseVoice）都不收。桥接 `_silk_to_wav_bytes` 用 `silk-python`（模块名 `pysilk`）解码 → 线性插值重采样到 **16kHz 单声道** → 包成 wav 再上传。依赖：`pip install silk-python`（py3.12 win 有预编译 wheel，pilk 在 py3.12 无 wheel 且需 MSVC，故弃用）。
 - 历史回写 user 记录追加 ` [语音]` 标记。
 - 配置：后端 `.env` `STT_API_URL/STT_API_KEY/STT_MODEL/STT_TIMEOUT_SECONDS/STT_MAX_BYTES`；桥接 `.env` `VOICE_TRANSCRIBE_ENABLED/VOICE_FALLBACK_TEXT/VOICE_MAX_BYTES`。
-- 说明：QQ 语音通常是 silk 格式，需确认 STT 上游能解析（whisper 默认不支持 silk，建议上游配 SenseVoice 或桥接侧先转码）。
+- 当前真机配置（本工作副本 `backend/.env` 已写）：
+  ```
+  STT_API_URL=https://api.siliconflow.cn/v1
+  STT_API_KEY=<复用 vision 的 SiliconFlow sk>
+  STT_MODEL=FunAudioLLM/SenseVoiceSmall   # 免费、中文好、自带标点
+  STT_TIMEOUT_SECONDS=60
+  STT_MAX_BYTES=52428800                   # 硅基上限 50MB
+  ```
+- 已验证：`SttClient` 直调 SiliconFlow 200 返回文本；silk→wav 往返（16kHz mono，帧数精确）；桥接 ruff + 导入 OK。
 
 ## 五、行为变更记录（提交时需注明）
 
@@ -62,6 +71,7 @@
 ## 七、部署提醒（真机）
 
 1. 同步 `backend/`（含 `.data/stickers` 642 张 + `.data/images`）与 `bridge/` 到真机，重启后端 + 桥接。
-2. 真机后端 `.env` 补 STT（`STT_API_URL/STT_API_KEY/STT_MODEL`）；桥接 `.env` 确认 `STICKER_DATA_DIR`、`VOICE_*`。
+2. 真机后端 `.env` 补 STT（`STT_API_URL/STT_API_KEY/STT_MODEL`，见上节）；桥接 `.env` 确认 `STICKER_DATA_DIR`、`VOICE_*`。
+3. 真机桥接环境安装 `silk-python`：`pip install silk-python`（silk→wav 必需，缺了语音链路自动降级为"无法识别"）。
 3. 验证清单：索图（「发张照片/表情包」→ 发图）；主动发图（聊到美食/日常）；语音消息回复；「发你语音/你照片发我」→ 完全静默 + 本人收到提醒；语气观察。
 4. 观察期：若 AI 选图不准，用 `--describe` 补描述或手动 `import_stickers.py` 精选 + WebUI 改名/写描述。
