@@ -26,6 +26,8 @@
 
 </div>
 
+> **本仓库为个人 fork**：基于 [kldhsh123/Afterglow](https://github.com/kldhsh123/Afterglow)（AGPL-3.0）二次开发，配套 [clone-ai-bot](https://github.com/Yanyan520234/clone-ai-bot) 桥接层在 QQ（OneBot / NapCat）中使用。主要增强见下方「[本分支增强](#本分支增强)」。
+
 ---
 
 > [!IMPORTANT]
@@ -58,6 +60,17 @@ Afterglow 是一个本地运行的 AI 朋友系统。它把真实聊天记录清
 | 记忆分层 | 区分真人历史、用户新消息和 AI 回复，默认防止 AI 内容污染长期人格 |
 | 开放接入 | 同时提供 OpenAI Chat Completions 与 Responses API，可接入第三方客户端 |
 | 本地优先 | LanceDB、本地 persona 和资源缓存，支持 PII 脱敏、Bearer 鉴权与全离线模型服务 |
+
+## 本分支增强
+
+本仓库为个人 fork（[Yanyan520234/Afterglow](https://github.com/Yanyan520234/Afterglow)），在上游基础上额外增强了与 [clone-ai-bot](https://github.com/Yanyan520234/clone-ai-bot) 桥接配合的能力：
+
+| 增强 | 说明 |
+|---|---|
+| 语音 / 图片媒体框可读 | 语音消息先 silk→wav 转码 + STT 转写、图片消息经 VLM 描述后注入对话框；人设加入硬约束，把转写 / 描图结果按可读内容处理，不再回复「听不了语音 / 打字吧」 |
+| 表情包注入 + 主动发送 | 主聊天提示词注入贴纸列表并鼓励主动使用；策略层在聊得轻松（calm / playful / chaotic）时放行表情包，主模型可常发 |
+
+其余能力与上游保持一致，详见上游 [README](https://github.com/kldhsh123/Afterglow)。
 
 ## 项目生态
 
