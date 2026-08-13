@@ -158,6 +158,40 @@ def rule_fallback_need_owner(user_text: str) -> list[str]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# 隐私类请求（规则层强制静默 + 提醒本人）
+# ---------------------------------------------------------------------------
+# 触及本人隐私的请求：要听本人声音、要本人照片/自拍、索要隐私信息。
+# 与"生活照"区分（四月/美食/海边等不在此列）。命中即：对对方完全静默 + 带出 need_owner 提醒。
+_PRIVACY_PATTERNS: tuple[tuple[str, str], ...] = (
+    (r"发(个|条)?语音", "对方想听本人的声音（语音）"),
+    (r"语音通话|语音电话|打个电话|给你打电话|打电话给你|通个话", "对方想和本人语音通话/打电话"),
+    (r"想听.{0,6}(你的|你|本人)声音", "对方想听本人的声音"),
+    (r"想听.{0,6}说话", "对方想听本人说话"),
+    (r"自拍", "对方想要本人自拍"),
+    (r"(你的|你本人|本人)的?照片", "对方想要本人照片"),
+    (r"发(张|个|条)?(你|本人)?的?照片", "对方想要本人照片"),
+    (r"身份证|家庭住址|家庭地址|银行卡", "对方索取本人隐私信息"),
+)
+
+
+def detect_privacy_request(user_text: str) -> list[str]:
+    """规则层检测隐私类请求：命中返回提醒提示列表，未命中返回空列表。
+
+    调用方（chat 路由）据此**强制静默**（不发可见消息），并把列表放进 need_owner
+    让桥接转发给 owner 本人定夺——AI 不得代替本人处理声音/照片等隐私。
+    """
+    if not user_text:
+        return []
+    text = user_text.strip()
+    hits: list[str] = []
+    for pattern, hint in _PRIVACY_PATTERNS:
+        if re.search(pattern, text):
+            if hint not in hits:
+                hits.append(hint)
+    return hits
+
+
 def build_policy_hint(
     decision: ResponseDecision,
     *,

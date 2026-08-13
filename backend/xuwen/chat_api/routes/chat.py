@@ -18,6 +18,7 @@ from xuwen.chat_api import turn_service
 from xuwen.chat_api.chat_pipeline import (
     available_sticker_names,
     build_sticker_retry_hint,
+    detect_privacy_request,
     effective_silence_sentinel,
     extract_life_events,
     extract_need_owner_hints,
@@ -284,6 +285,13 @@ async def chat_completions(
         if image_shas and len(image_shas) == len(vlm_descriptions):
             _spawn_history_image_persist(state, req, image_shas, vlm_descriptions, trace_id)
 
+    if req.voice_text and req.voice_text.strip():
+        voice = req.voice_text.strip()
+        frame = f"（对方发来一段语音：{voice}）"
+        current_user_text = (
+            (current_user_text + "\n" + frame).strip() if current_user_text else frame
+        )
+
     retrieval_query = current_user_text if current_user_text else "（用户发了一张图片）"
 
     # Layer A（共享管道）：检索 / 关系记忆 / life 并发。检索超时/失败抛类型化异常，
@@ -386,6 +394,60 @@ async def chat_completions(
         recent=recent,
         trace_id=trace_id,
     )
+
+    # 隐私类请求（要本人声音 / 要本人照片 / 要隐私信息）：触及本人隐私，
+    # 规则层强制静默——对对方完全不发可见消息，只把提醒带出给 owner（桥接转发）定夺。
+    # 放 web/url 调用之前，避免隐私请求还把消息发到搜索/URL 解析端。
+    privacy_hints = detect_privacy_request(current_user_text)
+    if privacy_hints:
+        if req.conversation_id and (current_user_text or image_shas):
+            await state.writeback.enqueue_turn(
+                WritebackTurn(
+                    conversation_id=req.conversation_id,
+                    user_text=current_user_text,
+                    assistant_text="",
+                    user_image_shas=image_shas,
+                )
+            )
+        await state.proactive_context_cache.append_turn(
+            caller_id=req.caller_id,
+            conversation_id=req.conversation_id,
+            user_text=current_user_text,
+            assistant_text="",
+        )
+        state.metrics.record(
+            "chat.silenced.privacy",
+            0.0,
+            detail=f"trace={trace_id},hints={','.join(privacy_hints)}",
+        )
+        await _ack_turn(state, turn_snapshot)
+        if req.stream:
+            return StreamingResponse(
+                _stream_silenced(
+                    settings=state.settings,
+                    model_name=model_name,
+                    trace_id=trace_id,
+                    policy=policy_hint,
+                ),
+                media_type="text/event-stream",
+            )
+        return ChatCompletionResponse(
+            model=model_name,
+            choices=[
+                Choice(
+                    index=0,
+                    message=APIChatMessage(
+                        role="assistant",
+                        content=state.settings.silence_response_sentinel,
+                    ),
+                    finish_reason=state.settings.silence_finish_reason,
+                )
+            ],
+            usage=Usage(),
+            trace_id=trace_id,
+            policy=policy_hint,
+            need_owner=privacy_hints,
+        )
 
     # silence 短路：放在 web/url 调用之前，避免用户说"别说话"还把消息发到搜索 / URL 解析端
     if not response_decision.should_reply:

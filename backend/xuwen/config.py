@@ -193,10 +193,18 @@ class Settings(BaseSettings):
     vision_api_url: str = ""
     vision_api_key: SecretStr = Field(default=SecretStr(""))
     vision_model: str = "qwen-vl-plus"
-    vision_describe_prompt: str = "请用一两句话客观描述这张图片的内容，不要发挥。"
+    vision_describe_prompt: str = "用一两句大白话，像朋友随口一提那样描述这张图里有什么、什么气氛。别说「这是一张图片/照片」这类话。"
     vision_timeout_seconds: float = 15.0
     # 单张图片最大字节（base64 解码后）；超过会被拒绝
     vision_max_image_bytes: int = 8 * 1024 * 1024  # 8MB
+    # 语音识别（STT）：OpenAI 兼容 audio/transcriptions 端点。
+    # 配置 STT_API_URL / STT_API_KEY / STT_MODEL 后，桥接可把语音转文字再注入对话。
+    stt_api_url: str = ""
+    stt_api_key: SecretStr = Field(default=SecretStr(""))
+    stt_model: str = "whisper-1"
+    stt_timeout_seconds: float = 60.0
+    # 单条语音最大字节；超过会被拒绝
+    stt_max_bytes: int = 25 * 1024 * 1024  # 25MB
     # 图片文件持久化目录（base64 原图按 sha256 文件名存盘）
     image_data_dir: Path = Path(".data/images")
     # 本地可发图片库目录（文件名即检索关键词，如 C:/Users/yang/阳图库）。

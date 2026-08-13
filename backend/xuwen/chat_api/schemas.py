@@ -97,6 +97,12 @@ class ChatCompletionRequest(BaseModel):
         default=None,
         description="调用方生成的单条用户消息 ID，用于把未完成消息排队并在成功回复后确认。",
     )
+    # Afterglow 扩展：IM 语音消息转写文本。非空时后端把最后一条 user 消息框成
+    # （对方发来一段语音：…），让主模型知道这是语音并自然回应。
+    voice_text: str | None = Field(
+        default=None,
+        description="语音转写文本；非空时后端按语音消息注入。",
+    )
 
     @field_validator("messages")
     @classmethod
