@@ -91,10 +91,46 @@ class StickerStore:
         for entry in raw:
             try:
                 s = Sticker(**entry)
-                self._cache[s.name] = s
             except (TypeError, ValueError):
                 continue
+            # 自愈：文件已被移走（如直接在数据目录里删图）的条目视为失效，
+            # 内存级过滤，AI / 桥接立即看不到它；落盘由 reconcile() 或下次 _save() 完成。
+            if (self._dir / s.filename()).exists():
+                self._cache[s.name] = s
         return self._cache
+
+    def reconcile(self) -> int:
+        """把「文件已不存在」的死条目从索引里清掉，让 index.json 与磁盘对齐。
+
+        直接删文件后无需重跑导入：内存读取已过滤（见 _load），这里只是把
+        index.json 持久化收紧。返回清理的条目数。
+        """
+        if not self._index_path.exists():
+            return 0
+        try:
+            raw = json.loads(self._index_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return 0
+        if not isinstance(raw, list):
+            return 0
+        stale_names: list[str] = []
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            sha = str(entry.get("sha") or "")
+            ext = str(entry.get("extension") or "")
+            name = str(entry.get("name") or "")
+            if not name or not sha or not ext:
+                continue
+            if not (self._dir / f"{sha}.{ext}").exists():
+                stale_names.append(name)
+        if not stale_names:
+            return 0
+        cache = self._load()
+        for n in stale_names:
+            cache.pop(n, None)
+        self._save()
+        return len(stale_names)
 
     def _save(self) -> None:
         data = [s.to_dict() for s in self._load().values()]

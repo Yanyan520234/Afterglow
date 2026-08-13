@@ -23,6 +23,10 @@
   - 运行结果：引用 3807 → 去重 672 文件名（阳=425 / 对方=247）→ 入库 642（sha 全唯一）。
 - `python scripts/import_stickers.py <图片目录> [--description ...] [--tags 手动] [--owner shared] [--dry-run]`
   - 手动精选导入；name=文件名（非法字符去掉），重复 name/sha 自动跳过。
+- **index 丢失/精简后重建**：`python scripts/rebuild_sticker_index.py [--qq-data-root ...] [--dry-run]`
+  - 只对**现存图文件**重建 `index.json`，不加回已删文件；name/描述/tag 与最初历史导入确定性一致；映射不到的现存文件用兜底名 `h{sha前16位}`（脚本会列出）。
+  - 当前状态：原 642 张已手动精简到 **436 张**（阳 300 / 对方 136 / 表情包 1），index 已重建（`list_all()==436`、`image_path` 全存在）。
+- **自愈**：`StickerStore` 读索引时内存过滤文件已缺失的条目（删图立即失效，无需重跑）；`reconcile()` 在**后端启动时**把 index.json 落盘收紧，此后每次增删的 `_save()` 也自动重写干净索引。桥接对缺失文件本就容错（返回 None 跳过发送）。
 
 ## 二、隐私请求 → 强制静默 + 提醒本人
 
@@ -61,7 +65,7 @@
 - 新增 4 个接口/字段：`POST /v1/audio/transcriptions`、`ChatCompletionRequest.voice_text`（其余 sticker 接口 P1 已有）。
 - 静默哨兵：新增 `finish_reason="silenced"` + `content=[silent]` 语义（桥接已适配）。
 - 隐私：规则层强制静默，命中不发任何消息（可能让"发语音/发照片"请求得不到回应——设计如此，见 P1 红线说明）。
-- 642 张历史表情包已入库（未 commit，`.data/` 被 ignore；部署时同步 backend/ 全目录）。
+- 436 张表情包已入库并重建索引（未 commit，`.data/` 被 ignore；部署时同步 backend/ 全目录）。
 
 ## 六、验证
 
@@ -70,8 +74,8 @@
 
 ## 七、部署提醒（真机）
 
-1. 同步 `backend/`（含 `.data/stickers` 642 张 + `.data/images`）与 `bridge/` 到真机，重启后端 + 桥接。
+1. 同步 `backend/`（含 `.data/stickers` 436 张 + `.data/images`）与 `bridge/` 到真机，重启后端 + 桥接。
 2. 真机后端 `.env` 补 STT（`STT_API_URL/STT_API_KEY/STT_MODEL`，见上节）；桥接 `.env` 确认 `STICKER_DATA_DIR`、`VOICE_*`。
 3. 真机桥接环境安装 `silk-python`：`pip install silk-python`（silk→wav 必需，缺了语音链路自动降级为"无法识别"）。
-3. 验证清单：索图（「发张照片/表情包」→ 发图）；主动发图（聊到美食/日常）；语音消息回复；「发你语音/你照片发我」→ 完全静默 + 本人收到提醒；语气观察。
-4. 观察期：若 AI 选图不准，用 `--describe` 补描述或手动 `import_stickers.py` 精选 + WebUI 改名/写描述。
+4. 验证清单：索图（「发张照片/表情包」→ 发图）；主动发图（聊到美食/日常）；语音消息回复；「发你语音/你照片发我」→ 完全静默 + 本人收到提醒；语气观察。
+5. 观察期：若 AI 选图不准，用 `--describe` 补描述或手动 `import_stickers.py` 精选 + WebUI 改名/写描述。

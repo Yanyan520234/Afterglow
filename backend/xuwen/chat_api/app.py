@@ -30,6 +30,7 @@ from xuwen.chat_api.routes import memory as memory_route
 from xuwen.chat_api.routes import responses as responses_route
 from xuwen.chat_api.routes import stickers as stickers_route
 from xuwen.chat_api.state import AppState, get_state
+from xuwen.chat_api.sticker_store import StickerStore
 from xuwen.chat_api.turn_coordinator import TurnCoordinator
 from xuwen.chat_api.web_fetch import WebFetchClient
 from xuwen.chat_api.web_search import WebSearchClient
@@ -206,6 +207,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # 新版本 / 失败 / 已禁用）会打印到 stdout。不阻塞 lifespan；不再周期重复，
         # 想再查由前端"立即检查"按钮（POST /info/check-update）触发。
         await update_checker.start()
+
+        # 表情包索引与磁盘对齐：文件已被直接删除的死条目不阻塞启动，只清理落盘。
+        try:
+            pruned = StickerStore(resolved_settings).reconcile()
+            if pruned:
+                print(f"表情包索引自愈：清理 {pruned} 个文件已缺失的条目", flush=True)
+        except Exception:
+            pass
 
         try:
             yield
