@@ -101,6 +101,18 @@ async def cancel_chat_turn(
     return ChatTurnCancelResponse(**result)
 
 
+def _frame_media(current_user_text: str, frame: str) -> str:
+    """把媒体描述（语音转写 / 图片描述）框进 user 文本。
+
+    user 文本为空或仅是“[非文本消息]”占位时直接替换成 frame，
+    避免占位符残留误导主模型（如语音已转写仍误判“听不了语音”）。
+    """
+    stripped = current_user_text.strip()
+    if not stripped or stripped == "[非文本消息]":
+        return frame
+    return f"{stripped}\n{frame}"
+
+
 def _spawn_history_image_persist(
     state: AppState,
     req: ChatCompletionRequest,
@@ -280,7 +292,7 @@ async def chat_completions(
         desc_block = "\n".join(
             f"（对方发来一张图：{d}）" for d in vlm_descriptions
         )
-        current_user_text = (current_user_text + "\n" + desc_block).strip()
+        current_user_text = _frame_media(current_user_text, desc_block)
         # 后台异步把图片描述写入 history_images 长期记忆（不阻塞本轮回复）
         if image_shas and len(image_shas) == len(vlm_descriptions):
             _spawn_history_image_persist(state, req, image_shas, vlm_descriptions, trace_id)
@@ -288,9 +300,7 @@ async def chat_completions(
     if req.voice_text and req.voice_text.strip():
         voice = req.voice_text.strip()
         frame = f"（对方发来一段语音：{voice}）"
-        current_user_text = (
-            (current_user_text + "\n" + frame).strip() if current_user_text else frame
-        )
+        current_user_text = _frame_media(current_user_text, frame)
 
     retrieval_query = current_user_text if current_user_text else "（用户发了一张图片）"
 
