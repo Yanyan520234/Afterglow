@@ -259,6 +259,9 @@ def test_build_messages_includes_no_new_emoji_guard():
     assert "不要把 QQ / 聊天导出的占位符转换成 emoji" in system
     assert "不要把你之前生成过的回复当作 emoji / 颜文字使用依据" in system
     assert "不要输出 `[图片]`、`[语音]`、`[视频]`" in system
+    assert "听不了语音" in system
+    assert "对方发来一段语音" in system
+    assert "对方发来一张图" in system
     assert "不要主动加入“想你”“有没有想我”“抱抱”“亲亲”“爱你”等亲密内容" in system
     assert "不要因为用户问“在干嘛”“在吗”等寒暄" in system
     assert "[[爱心]]" in system
