@@ -167,6 +167,46 @@ def test_policy_image_and_sticker_requests():
     assert sticker.use_sticker is True
 
 
+def test_policy_proactive_sticker_in_casual_chat():
+    decision = decide_response_policy(
+        current_user_text="今天好开心哈哈",
+        has_images=False,
+        retrieved=_retrieved(with_history=True),
+        life=_life(),
+        relationship_context="",
+        recent=[],
+    )
+    assert decision.reply_mode in {"calm", "playful", "chaotic"}
+    assert decision.use_sticker is True
+    assert any("常发" in item for item in decision.instructions)
+
+
+def test_policy_no_proactive_sticker_when_unsafe():
+    decision = decide_response_policy(
+        current_user_text="我不想活了",
+        has_images=False,
+        retrieved=_retrieved(with_history=True),
+        life=_life(),
+        relationship_context="",
+        recent=[],
+    )
+    assert decision.use_sticker is False
+    assert decision.reply_mode == "serious"
+
+
+def test_policy_no_proactive_sticker_when_image_message():
+    decision = decide_response_policy(
+        current_user_text="快看看这张",
+        has_images=True,
+        retrieved=_retrieved(with_history=True),
+        life=_life(),
+        relationship_context="",
+        recent=[],
+    )
+    assert decision.reply_mode == "image"
+    assert decision.use_sticker is False
+
+
 def test_policy_life_question_focuses_life_state():
     decision = decide_response_policy(
         current_user_text="你在干嘛",

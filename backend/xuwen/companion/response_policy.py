@@ -334,6 +334,21 @@ def decide_response_policy(
         focus = "relationship_memory" if relationship_context else "none"
         instructions.append("真人历史证据弱，不要强行模仿；可以自然追问或轻微转移。")
 
+    # 主动表情包：聊得轻松（risk=low、非严肃/沉默/不安全/带图）时，策略层直接放行
+    # 主模型常发已配置表情包。真正发不发、发哪张仍由主模型结合贴纸列表决定；
+    # 这里只影响「是否优先用表情包：是/否」这一高优先级提示。
+    if (
+        not use_sticker
+        and risk == "low"
+        and mode in {"calm", "playful", "chaotic"}
+        and not has_images
+        and user_state not in {"unsafe", "angry"}
+    ):
+        use_sticker = True
+        instructions.append(
+            "聊得轻松，可以常发贴合语境的已配置表情包带动氛围；文字仍为主，不要每轮硬发。"
+        )
+
     if not instructions:
         instructions.append("按真人历史风格自然短回。")
 
